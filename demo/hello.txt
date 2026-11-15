@@ -1,0 +1,2 @@
+Gateway demo target.
+Written by the OpenCode demo, read back through MCP.
