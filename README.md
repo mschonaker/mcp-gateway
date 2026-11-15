@@ -46,10 +46,11 @@ bash examples/simple_example.sh
 The image bundles the BEAM runtime plus Node.js, so `npx`-based MCP upstreams
 work with nothing else installed. The gateway listens on `8080`.
 
-Run it straight from this repository, no clone:
+Run it straight from this repository, no clone (note the `.git` suffix — it
+is required, or Docker fetches the web page instead of the repo):
 
 ```bash
-docker run -it --rm -p 8080:8080 $(docker build -q https://github.com/mschonaker/mcp-gateway)
+docker run -it --rm -p 8080:8080 $(docker build -q https://github.com/mschonaker/mcp-gateway.git)
 ```
 
 Or pull the published multi-arch image (`linux/amd64`, `linux/arm64`):

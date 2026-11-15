@@ -22,8 +22,8 @@ jobs:
 
       - name: Run test suite in an Elixir container
         run: |
-          docker run --rm -v "$PWD":/app -w /app elixir:1.20-slim \
-            sh -c "mix deps.get && mix test && MIX_ENV=prod mix compile --warnings-as-errors"
+          docker run --rm -v "$PWD":/app -w /app elixir:1.20-slim sh -c \
+            "mix local.hex --force && mix deps.get && mix test && MIX_ENV=prod mix compile --warnings-as-errors"
 
   image:
     needs: test
