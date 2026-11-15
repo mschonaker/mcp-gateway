@@ -41,6 +41,37 @@ termination. Every step must pass, or the script exits non-zero.
 bash examples/simple_example.sh
 ```
 
+## Docker
+
+The image bundles the BEAM runtime plus Node.js, so `npx`-based MCP upstreams
+work with nothing else installed. The gateway listens on `8080`.
+
+Run it straight from this repository, no clone:
+
+```bash
+docker run -it --rm -p 8080:8080 $(docker build -q https://github.com/mschonaker/mcp-gateway)
+```
+
+Or pull the published multi-arch image (`linux/amd64`, `linux/arm64`):
+
+```bash
+docker run -it --rm -p 8080:8080 ghcr.io/mschonaker/mcp-gateway:latest
+```
+
+Then point your MCP client at `http://localhost:8080/mcp`.
+
+With an upstream mounted in, here a filesystem server jailed to `~/notes`:
+
+```bash
+docker run -it --rm -p 8080:8080 \
+  -v "$HOME/notes:/data" \
+  -e MCP_UPSTREAMS='[{"name":"files","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/data"]}]' \
+  ghcr.io/mschonaker/mcp-gateway:latest
+```
+
+`MCP_UPSTREAMS` is the same JSON array described above. `PORT` changes the
+listen port. Build your own image with `docker build -t mcp-gateway .`.
+
 Configure upstreams with the `MCP_UPSTREAMS` environment variable (a JSON
 array) or in `config/config.exs`:
 

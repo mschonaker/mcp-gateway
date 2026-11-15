@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run test suite in an Elixir container
+        run: |
+          docker run --rm -v "$PWD":/app -w /app elixir:1.20-slim \
+            sh -c "mix deps.get && mix test && MIX_ENV=prod mix compile --warnings-as-errors"
+
+  image:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU for arm64 builds
+        run: docker run --privileged --rm tonistiigi/binfmt --install arm64
+
+      - name: Set up buildx builder
+        run: docker buildx create --use --driver docker-container --name multiarch
+
+      - name: Smoke test the amd64 image
+        run: |
+          docker buildx build --builder multiarch --load \
+            --platform linux/amd64 -t mcp-gateway-smoke .
+          docker run -d --rm --name gw -p 8080:8080 mcp-gateway-smoke
+          status=1
+          for _ in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/health > /dev/null; then status=0; break; fi
+            sleep 1
+          done
+          docker logs gw
+          docker stop gw
+          [ "$status" = 0 ] && echo "smoke: gateway healthy" || { echo "smoke: gateway never became healthy"; exit 1; }
+
+      - name: Log in to GHCR
+        if: github.event_name != 'workflow_dispatch'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push multi-arch image
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            exec docker buildx build --builder multiarch \
+              --platform linux/amd64,linux/arm64 \
+              --tag "${IMAGE}:test" .
+          fi
+          docker buildx build --builder multiarch --push \
+            --platform linux/amd64,linux/arm64 \
+            --tag "${IMAGE}:${GITHUB_REF_NAME#v}" \
+            --tag "${IMAGE}:latest" \
+            .
