@@ -155,6 +155,10 @@ back on the way down. Published SHA-256 digests still verify, because content
 passes through byte for byte. The gateway advertises the extension only while
 some upstream actually serves skills.
 
+Client support for the extension is still rolling out. See
+[docs/sep-2640-status.md](docs/sep-2640-status.md) for the ecosystem status
+as of 2026-11-15.
+
 ## Known limitations
 
 - Upstream transport is stdio only. Remote HTTP/SSE upstreams are not proxied.
