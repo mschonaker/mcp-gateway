@@ -10,7 +10,7 @@ defmodule McpGateway.Router do
   use Plug.Router
   require Logger
 
-  alias McpGateway.{Sessions, Upstream}
+  alias McpGateway.{Sessions, Skills, Upstream}
 
   @protocol_version "2025-03-26"
   @supported_versions ["2024-11-05", "2025-03-26"]
@@ -85,6 +85,10 @@ defmodule McpGateway.Router do
       "ping" -> result(id, %{})
       "tools/list" -> result(id, %{"tools" => all_tools()})
       "tools/call" -> call_tool(id, params)
+      "skills/list" -> result(id, %{"skills" => all_skills()})
+      "skills/get" -> skills_get(id, params)
+      "resources/list" -> result(id, %{"resources" => all_resources()})
+      "resources/read" -> resource_read(id, params)
       _ -> error(id, -32601, "Method not found: #{method}")
     end
   end
@@ -107,10 +111,18 @@ defmodule McpGateway.Router do
                 result(id, tool_error_result(error))
 
               {:ok, _malformed} ->
-                result(id, tool_error_result(%{"message" => "malformed response from '#{server}'"}))
+                result(
+                  id,
+                  tool_error_result(%{"message" => "malformed response from '#{server}'"})
+                )
 
               {:error, reason} ->
-                result(id, tool_error_result(%{"message" => "upstream '#{server}' failed: #{inspect(reason)}"}))
+                result(
+                  id,
+                  tool_error_result(%{
+                    "message" => "upstream '#{server}' failed: #{inspect(reason)}"
+                  })
+                )
             end
         end
 
@@ -123,9 +135,86 @@ defmodule McpGateway.Router do
     error(id, -32602, "tools/call requires a 'name' parameter")
   end
 
+  # SEP-2640 requires -32602 for unknown URIs, which clients use to stop loading.
+  defp skills_get(id, %{"uri" => uri}) when is_binary(uri) do
+    case route_uri(uri) do
+      {:ok, server, original} ->
+        case guarded(fn -> Upstream.get_skill(server, original) end) do
+          {:ok, %{"result" => %{"skill" => skill}}} ->
+            result(id, %{"skill" => Skills.namespace(server, skill)})
+
+          {:ok, %{"error" => error}} ->
+            %{"jsonrpc" => "2.0", "id" => id, "error" => error}
+
+          {:ok, _malformed} ->
+            error(id, -32603, "Malformed skills/get response from '#{server}'")
+
+          {:error, reason} ->
+            error(id, -32603, "Upstream '#{server}' failed: #{inspect(reason)}")
+        end
+
+      {:unknown_server, server} ->
+        error(id, -32602, "No MCP server named '#{server}'")
+
+      {:unknown_uri, uri} ->
+        error(id, -32602, "Not a gateway skill URI: #{uri}")
+    end
+  end
+
+  defp skills_get(id, _params) do
+    error(id, -32602, "skills/get requires a 'uri' parameter")
+  end
+
+  defp resource_read(id, %{"uri" => uri}) when is_binary(uri) do
+    case route_uri(uri) do
+      {:ok, server, original} ->
+        case guarded(fn -> Upstream.read_resource(server, original) end) do
+          {:ok, %{"result" => %{"contents" => contents}}} ->
+            result(id, %{"contents" => Enum.map(contents, &Skills.namespace_content(server, &1))})
+
+          {:ok, %{"error" => error}} ->
+            %{"jsonrpc" => "2.0", "id" => id, "error" => error}
+
+          {:ok, _malformed} ->
+            error(id, -32603, "Malformed resources/read response from '#{server}'")
+
+          {:error, reason} ->
+            error(id, -32603, "Upstream '#{server}' failed: #{inspect(reason)}")
+        end
+
+      {:unknown_server, server} ->
+        error(id, -32602, "No MCP server named '#{server}'")
+
+      {:unknown_uri, uri} ->
+        error(id, -32602, "Not a gateway skill URI: #{uri}")
+    end
+  end
+
+  defp resource_read(id, _params) do
+    error(id, -32602, "resources/read requires a 'uri' parameter")
+  end
+
+  defp route_uri(uri) do
+    case Skills.denamespace(uri) do
+      {:ok, server, original} ->
+        if Registry.lookup(McpGateway.Upstreams, server) == [] do
+          {:unknown_server, server}
+        else
+          {:ok, server, original}
+        end
+
+      :error ->
+        {:unknown_uri, uri}
+    end
+  end
+
   defp safe_call(server, tool, arguments) do
+    guarded(fn -> Upstream.call_tool(server, tool, arguments) end)
+  end
+
+  defp guarded(fun) do
     try do
-      Upstream.call_tool(server, tool, arguments)
+      fun.()
     catch
       :exit, reason -> {:error, reason}
     end
@@ -148,15 +237,61 @@ defmodule McpGateway.Router do
     Registry.select(McpGateway.Upstreams, [{{:"$1", :_, :_}, [], [:"$1"]}])
   end
 
+  defp all_skills do
+    upstream_names()
+    |> Enum.flat_map(fn name ->
+      try do
+        Upstream.list_skills(name)
+      catch
+        :exit, reason ->
+          Logger.warning("[#{name}] unavailable: #{inspect(reason)}")
+          []
+      end
+    end)
+  end
+
+  # The skill manifests double as the gateway's resource catalog.
+  defp all_resources do
+    Enum.flat_map(all_skills(), fn skill ->
+      case skill["resources"] do
+        files when is_list(files) ->
+          Enum.map(files, fn file ->
+            %{
+              "uri" => file["uri"],
+              "name" => file["uri"] |> String.split("/") |> List.last(),
+              "description" => "file of skill #{get_in(skill, ["frontmatter", "name"])}"
+            }
+          end)
+
+        _ ->
+          []
+      end
+    end)
+  end
+
   defp initialize_result(req) do
     requested = get_in(req, ["params", "protocolVersion"])
     version = if requested in @supported_versions, do: requested, else: @protocol_version
 
     %{
       "protocolVersion" => version,
-      "capabilities" => %{"tools" => %{"listChanged" => false}},
+      "capabilities" => capabilities(),
       "serverInfo" => @server_info
     }
+  end
+
+  # The skills extension is advertised only when some upstream currently
+  # serves skills, so clients never call skills/list against a tools-only farm.
+  defp capabilities do
+    base = %{"tools" => %{"listChanged" => false}}
+
+    case all_skills() do
+      [] ->
+        base
+
+      _ ->
+        Map.merge(base, %{"resources" => %{}, "extensions" => %{Skills.extension() => %{}}})
+    end
   end
 
   defp invalid_request?(body) do

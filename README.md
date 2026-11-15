@@ -109,12 +109,25 @@ curl -s -X DELETE "$URL" -H "Mcp-Session-Id: $session" -o /dev/null -w '%{http_c
 | `lib/mcp_gateway/application.ex` | Supervision tree. Starts Bandit and configured upstreams.          |
 | `lib/mcp_gateway/router.ex`      | Streamable HTTP endpoint. Session handling and RPC multiplexing.   |
 | `lib/mcp_gateway/upstream.ex`    | GenServer per stdio server. Handshake, tool cache, call proxying.  |
+| `lib/mcp_gateway/skills.ex`      | URI namespacing for the skills extension (SEP-2640).               |
 | `lib/mcp_gateway/sessions.ex`    | `Mcp-Session-Id` registry (in-memory).                             |
 | `priv/fake_mcp_server.exs`       | Fake upstream used by the test suite.                              |
+
+## Skills (SEP-2640)
+
+Upstream servers that declare the `io.modelcontextprotocol/skills` extension
+are fetched at handshake. The gateway aggregates them, rewrites each skill URI
+to `skill://<server>__<name>/...` so servers cannot collide, forwards
+`skills/get` and `resources/read` with the original URI, and rewrites the URIs
+back on the way down. Published SHA-256 digests still verify, because content
+passes through byte for byte. The gateway advertises the extension only while
+some upstream actually serves skills.
 
 ## Known limitations
 
 - Upstream transport is stdio only. Remote HTTP/SSE upstreams are not proxied.
+- Skill URIs are namespaced with `__`, so an upstream server name must not
+  contain `__` (same constraint as tool names).
 - Sessions live in one node's memory. They do not survive a restart and are
   not shared across nodes.
 - No authentication, rate limiting, or per-tool ACLs. Put the gateway behind

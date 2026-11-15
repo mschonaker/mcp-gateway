@@ -10,8 +10,9 @@ defmodule McpGatewayTest do
 
   setup do
     ensure_upstream("fake")
-    # Blocks until the upstream handshake and tools/list complete.
+    # Blocks until the upstream handshake, tools/list, and skills/list complete.
     assert length(Upstream.list_tools("fake")) == 2
+    assert length(Upstream.list_skills("fake")) == 1
     :ok
   end
 
@@ -101,6 +102,79 @@ defmodule McpGatewayTest do
     test "reports unknown servers" do
       conn = session_request("tools/call", %{"name" => "nosuch__echo"})
       assert json_body(conn)["error"]["code"] == -32602
+    end
+  end
+
+  describe "skills extension" do
+    test "initialize advertises the extension only because an upstream serves skills" do
+      conn = rpc("initialize", initialize_params()) |> request()
+      caps = json_body(conn)["result"]["capabilities"]
+      assert get_in(caps, ["extensions", "io.modelcontextprotocol/skills"]) == %{}
+      assert Map.has_key?(caps, "resources")
+    end
+
+    test "skills/list returns namespaced entries with full manifests" do
+      conn = session_request("skills/list")
+
+      skill =
+        json_body(conn)["result"]["skills"]
+        |> Enum.find(&(&1["uri"] == "skill://fake__greet/SKILL.md"))
+
+      assert skill["frontmatter"]["name"] == "fake__greet"
+      assert skill["frontmatter"]["description"] == "Greet someone warmly."
+
+      uris = Enum.map(skill["resources"], & &1["uri"])
+      assert uris == ["skill://fake__greet/SKILL.md", "skill://fake__greet/references/usage.md"]
+    end
+
+    test "skills/get rewrites a single entry" do
+      conn = session_request("skills/get", %{"uri" => "skill://fake__greet/SKILL.md"})
+      assert json_body(conn)["result"]["skill"]["uri"] == "skill://fake__greet/SKILL.md"
+    end
+
+    test "skills/get unknown uri returns a -32602 protocol error" do
+      conn = session_request("skills/get", %{"uri" => "skill://fake__nope/SKILL.md"})
+      assert json_body(conn)["error"]["code"] == -32602
+    end
+
+    test "resources/list catalogs every manifest file" do
+      conn = session_request("resources/list")
+      uris = json_body(conn)["result"]["resources"] |> Enum.map(& &1["uri"])
+      assert "skill://fake__greet/SKILL.md" in uris
+      assert "skill://fake__greet/references/usage.md" in uris
+    end
+
+    test "read content verifies against the published digest" do
+      listed = session_request("skills/list") |> json_body()
+
+      skill =
+        listed["result"]["skills"]
+        |> Enum.find(&(&1["uri"] == "skill://fake__greet/SKILL.md"))
+
+      conn =
+        session_request("resources/read", %{"uri" => "skill://fake__greet/references/usage.md"})
+
+      [%{"uri" => uri, "text" => text} | _] = json_body(conn)["result"]["contents"]
+      assert uri == "skill://fake__greet/references/usage.md"
+
+      digest = "sha256:" <> (:crypto.hash(:sha256, text) |> Base.encode16(case: :lower))
+      published = Enum.find(skill["resources"], &(&1["uri"] == uri))
+      assert published["digest"] == digest
+      assert published["size"] == byte_size(text)
+    end
+
+    test "skills from two upstreams coexist under distinct uris" do
+      ensure_upstream("second")
+      conn = session_request("skills/list")
+
+      uris =
+        conn
+        |> json_body()
+        |> get_in(["result", "skills"])
+        |> Enum.map(& &1["uri"])
+        |> Enum.sort()
+
+      assert uris == ["skill://fake__greet/SKILL.md", "skill://second__greet/SKILL.md"]
     end
   end
 

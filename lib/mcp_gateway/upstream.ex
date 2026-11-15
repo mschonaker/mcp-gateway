@@ -3,18 +3,21 @@ defmodule McpGateway.Upstream do
   GenServer that owns one stdio MCP server process.
 
   Spawns the server via a line-delimited Port, performs the MCP handshake,
-  caches its (namespaced) tool list, and forwards tools/call requests.
-  Requests that arrive before the handshake completes are queued, so cold
-  starts like `npx -y ...` do not surface as errors.
+  caches its (namespaced) tool list and skill list, and forwards tools/call,
+  skills/get, and resources/read requests. Requests that arrive before the
+  handshake completes are queued, so cold starts like `npx -y ...` do not
+  surface as errors.
   """
   use GenServer
   require Logger
+
+  alias McpGateway.Skills
 
   @protocol_version "2025-03-26"
   @client_info %{"name" => "elixir-mcp-gateway", "version" => "0.1.0"}
   @call_timeout 30_000
 
-  defstruct [:name, :port, :next_id, :tools, pending: %{}, queued: []]
+  defstruct [:name, :port, :next_id, :tools, :skills, pending: %{}, queued: []]
 
   def start_link(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -35,6 +38,18 @@ defmodule McpGateway.Upstream do
 
   def call_tool(name, tool, arguments) do
     GenServer.call(via(name), {:call_tool, tool, arguments}, @call_timeout)
+  end
+
+  def list_skills(name) do
+    GenServer.call(via(name), :list_skills, @call_timeout)
+  end
+
+  def get_skill(name, uri) do
+    GenServer.call(via(name), {:get_skill, uri}, @call_timeout)
+  end
+
+  def read_resource(name, uri) do
+    GenServer.call(via(name), {:read_resource, uri}, @call_timeout)
   end
 
   @impl true
@@ -126,6 +141,30 @@ defmodule McpGateway.Upstream do
     {:noreply, request(state, "tools/call", params, from)}
   end
 
+  def handle_call(:list_skills, from, %{skills: nil} = state) do
+    {:noreply, %{state | queued: state.queued ++ [{:skills, from}]}}
+  end
+
+  def handle_call(:list_skills, _from, state) do
+    {:reply, state.skills, state}
+  end
+
+  def handle_call({:get_skill, uri}, from, %{tools: nil} = state) do
+    {:noreply, %{state | queued: state.queued ++ [{:get_skill, uri, from}]}}
+  end
+
+  def handle_call({:get_skill, uri}, from, state) do
+    {:noreply, request(state, "skills/get", %{"uri" => uri}, from)}
+  end
+
+  def handle_call({:read_resource, uri}, from, %{tools: nil} = state) do
+    {:noreply, %{state | queued: state.queued ++ [{:read_resource, uri, from}]}}
+  end
+
+  def handle_call({:read_resource, uri}, from, state) do
+    {:noreply, request(state, "resources/read", %{"uri" => uri}, from)}
+  end
+
   # A message with both "id" and "method" is a server-initiated request.
   # The gateway does not support server-initiated methods, so reject them.
   defp handle_message(%{"id" => id, "method" => method}, state) do
@@ -149,6 +188,10 @@ defmodule McpGateway.Upstream do
     {:noreply, request(state, "tools/list", %{}, :fetch_tools)}
   end
 
+  defp handle_message(%{"method" => "notifications/resources/list_changed"}, state) do
+    {:noreply, request(state, "skills/list", %{}, {:fetch_skills, []})}
+  end
+
   defp handle_message(%{"method" => "notifications/" <> _}, state) do
     {:noreply, state}
   end
@@ -163,7 +206,13 @@ defmodule McpGateway.Upstream do
       {:handshake, pending} ->
         state = %{state | pending: pending}
         write(state.port, %{"jsonrpc" => "2.0", "method" => "notifications/initialized"})
-        {:noreply, request(state, "tools/list", %{}, :fetch_tools)}
+        state = request(state, "tools/list", %{}, :fetch_tools)
+
+        if Skills.declared?(response) do
+          {:noreply, request(state, "skills/list", %{}, {:fetch_skills, []})}
+        else
+          {:noreply, %{state | skills: []} |> flush_queue()}
+        end
 
       {:fetch_tools, pending} ->
         tools =
@@ -173,6 +222,21 @@ defmodule McpGateway.Upstream do
         Logger.info("[#{state.name}] loaded #{length(tools)} tools")
         state = %{state | tools: tools, pending: pending}
         {:noreply, flush_queue(state)}
+
+      {{:fetch_skills, acc}, pending} ->
+        state = %{state | pending: pending}
+        skills = acc ++ (get_in(response, ["result", "skills"]) || [])
+
+        case get_in(response, ["result", "nextCursor"]) do
+          nil ->
+            namespaced = Enum.map(skills, &Skills.namespace(state.name, &1))
+            Logger.info("[#{state.name}] loaded #{length(namespaced)} skills")
+            {:noreply, flush_queue(%{state | skills: namespaced})}
+
+          cursor ->
+            {:noreply,
+             request(state, "skills/list", %{"cursor" => cursor}, {:fetch_skills, skills})}
+        end
 
       {from, pending} when is_tuple(from) ->
         GenServer.reply(from, {:ok, response})
@@ -192,18 +256,33 @@ defmodule McpGateway.Upstream do
   defp flush_queue(%{queued: []} = state), do: state
 
   defp flush_queue(state) do
+    {ready, waiting} = Enum.split_with(state.queued, fn item -> queued_ready?(item, state) end)
+
     state =
-      Enum.reduce(state.queued, state, fn
+      Enum.reduce(ready, state, fn
         {:list, from}, acc ->
           GenServer.reply(from, acc.tools)
           acc
 
+        {:skills, from}, acc ->
+          GenServer.reply(from, acc.skills)
+          acc
+
         {:call, tool, arguments, from}, acc ->
           request(acc, "tools/call", %{"name" => tool, "arguments" => arguments}, from)
+
+        {:get_skill, uri, from}, acc ->
+          request(acc, "skills/get", %{"uri" => uri}, from)
+
+        {:read_resource, uri, from}, acc ->
+          request(acc, "resources/read", %{"uri" => uri}, from)
       end)
 
-    %{state | queued: []}
+    %{state | queued: waiting}
   end
+
+  defp queued_ready?({:skills, _}, state), do: state.skills != nil
+  defp queued_ready?(_item, state), do: state.tools != nil
 
   defp tool_key(server, tool), do: "#{server}__#{tool}"
 

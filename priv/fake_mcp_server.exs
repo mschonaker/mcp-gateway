@@ -3,9 +3,14 @@ defmodule FakeMCPServer do
   Minimal stdio MCP server used only by the test suite.
 
   Reads line-delimited JSON-RPC on stdin, answers initialize, tools/list,
-  ping, and tools/call for two tools: echo and boom. Fields are extracted
-  with regexes so the script needs no JSON library.
+  ping, and tools/call for two tools (echo and boom), and serves one skill
+  through the io.modelcontextprotocol/skills extension (SEP-2640):
+  skills/list, skills/get, resources/list, and resources/read.
+  Fields are extracted with regexes so the script needs no JSON library.
   """
+
+  @skill_md "---\nname: greet\ndescription: Greet someone warmly.\n---\n\n# Greet\n\nRead `references/usage.md`, then greet the person.\n"
+  @usage_md "Use a friendly tone. Keep greetings under ten words.\n"
 
   def run do
     case IO.read(:stdio, :line) do
@@ -32,7 +37,7 @@ defmodule FakeMCPServer do
       {"initialize", id} ->
         emit(id, %{
           "protocolVersion" => "2025-03-26",
-          "capabilities" => %{},
+          "capabilities" => %{"extensions" => %{"io.modelcontextprotocol/skills" => %{}}},
           "serverInfo" => %{"name" => "fake", "version" => "0.1.0"}
         })
 
@@ -58,14 +63,63 @@ defmodule FakeMCPServer do
           {tool, text} -> emit(id, %{"content" => [%{"type" => "text", "text" => "echo:#{tool}:#{text}"}]})
         end
 
+      {"skills/list", id} ->
+        emit(id, %{"skills" => [skill_entry()]})
+
+      {"skills/get", id} ->
+        uri = str_field(line, "uri")
+
+        if skill_covers?(uri) do
+          emit(id, %{"skill" => skill_entry()})
+        else
+          emit_error(id, -32602, "unknown skill: #{uri}")
+        end
+
+      {"resources/list", id} ->
+        emit(id, %{"resources" => Enum.map(skill_files(), &%{"uri" => &1["uri"], "name" => Path.basename(&1["uri"])})})
+
+      {"resources/read", id} ->
+        uri = str_field(line, "uri")
+
+        case Enum.find(skill_files(), &(&1["uri"] == uri)) do
+          nil -> emit_error(id, -32602, "unknown resource: #{uri}")
+          file -> emit(id, %{"contents" => [%{"uri" => uri, "mimeType" => "text/markdown", "text" => file["content"]}]})
+        end
+
       {"ping", id} ->
         emit(id, %{})
 
       {unknown, id} ->
         emit_error(id, -32601, "Method not found: #{unknown}")
     end
+  end
 
-    :continue
+  defp skill_files do
+    [
+      %{"uri" => "skill://greet/SKILL.md", "content" => @skill_md},
+      %{"uri" => "skill://greet/references/usage.md", "content" => @usage_md}
+    ]
+  end
+
+  defp skill_entry do
+    manifest =
+      Enum.map(skill_files(), fn file ->
+        %{"uri" => file["uri"], "digest" => digest(file["content"]), "size" => byte_size(file["content"])}
+      end)
+
+    %{
+      "uri" => "skill://greet/SKILL.md",
+      "frontmatter" => %{"name" => "greet", "description" => "Greet someone warmly."},
+      "resources" => manifest
+    }
+  end
+
+  defp skill_covers?(uri) do
+    uri == "skill://greet/SKILL.md" or Enum.any?(skill_files(), &(&1["uri"] == uri))
+  end
+
+  defp digest(content) do
+    "sha256:" <> Base.encode16(:crypto.hash(:sha256, content), case: :lower)
   end
 
   defp int_field(line, key) do
@@ -108,7 +162,12 @@ defmodule FakeMCPServer do
   end
 
   defp escape(value) do
-    value |> String.replace("\\", "\\\\") |> String.replace("\"", "\\\"")
+    value
+    |> String.replace("\\", "\\\\")
+    |> String.replace("\"", "\\\"")
+    |> String.replace("\n", "\\n")
+    |> String.replace("\r", "\\r")
+    |> String.replace("\t", "\\t")
   end
 end
 
