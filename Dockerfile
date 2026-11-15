@@ -26,8 +26,10 @@ RUN apt-get update \
 
 # Node.js LTS with npm/npx, checksum-verified, so npx-based MCP upstreams
 # work out of the box. Pinned: bump deliberately, never implicitly.
+# Node's asset name for amd64 is x64; arm64 matches Docker's TARGETARCH.
+# case, not ${var/...}, because RUN uses dash.
 RUN cd /tmp \
-    && NODE_ARCH="${TARGETARCH/amd64/x64}" \
+    && case "$TARGETARCH" in amd64) NODE_ARCH=x64 ;; *) NODE_ARCH="$TARGETARCH" ;; esac \
     && curl -fsSL "https://nodejs.org/dist/v26.13.1/SHASUMS256.txt" -o SHASUMS256.txt \
     && curl -fsSL "https://nodejs.org/dist/v26.13.1/node-v26.13.1-linux-${NODE_ARCH}.tar.xz" -O \
     && grep " node-v26.13.1-linux-${NODE_ARCH}.tar.xz$" SHASUMS256.txt > check.txt \
