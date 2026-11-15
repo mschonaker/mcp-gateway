@@ -22,8 +22,11 @@ jobs:
 
       - name: Run test suite in an Elixir container
         run: |
-          docker run --rm -v "$PWD":/app -w /app elixir:1.20-slim sh -c \
-            "mix local.hex --force && mix deps.get && mix test && MIX_ENV=prod mix compile --warnings-as-errors"
+          # elixir:*-slim ships without a CA bundle; OTP 29 refuses TLS without one.
+          docker run --rm -v "$PWD":/app -w /app elixir:1.20-slim bash -c \
+            "apt-get update -qq && apt-get install -y -qq ca-certificates >/dev/null \
+            && mix local.hex --force && mix deps.get && mix test \
+            && MIX_ENV=prod mix compile --warnings-as-errors"
 
   image:
     needs: test
