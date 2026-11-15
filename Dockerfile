@@ -27,12 +27,13 @@ RUN apt-get update \
 # Node.js LTS with npm/npx, checksum-verified, so npx-based MCP upstreams
 # work out of the box. Pinned: bump deliberately, never implicitly.
 RUN cd /tmp \
+    && NODE_ARCH="${TARGETARCH/amd64/x64}" \
     && curl -fsSL "https://nodejs.org/dist/v26.13.1/SHASUMS256.txt" -o SHASUMS256.txt \
-    && curl -fsSL "https://nodejs.org/dist/v26.13.1/node-v26.13.1-linux-${TARGETARCH}.tar.xz" -O \
-    && grep " node-v26.13.1-linux-${TARGETARCH}.tar.xz$" SHASUMS256.txt > check.txt \
+    && curl -fsSL "https://nodejs.org/dist/v26.13.1/node-v26.13.1-linux-${NODE_ARCH}.tar.xz" -O \
+    && grep " node-v26.13.1-linux-${NODE_ARCH}.tar.xz$" SHASUMS256.txt > check.txt \
     && sha256sum -c check.txt \
-    && tar -xJf "node-v26.13.1-linux-${TARGETARCH}.tar.xz" -C /usr/local --strip-components=1 \
-    && rm "node-v26.13.1-linux-${TARGETARCH}.tar.xz" SHASUMS256.txt check.txt
+    && tar -xJf "node-v26.13.1-linux-${NODE_ARCH}.tar.xz" -C /usr/local --strip-components=1 \
+    && rm "node-v26.13.1-linux-${NODE_ARCH}.tar.xz" SHASUMS256.txt check.txt
 
 WORKDIR /app
 COPY --from=builder --chown=app:app /app/_build/prod/rel/mcp_gateway ./
