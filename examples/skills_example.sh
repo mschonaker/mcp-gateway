@@ -1,54 +1,82 @@
 #!/usr/bin/env bash
-# Skills extension walkthrough (SEP-2640) against a running gateway.
-# Assumes the echo upstream (priv/fake_mcp_server.exs) is configured.
-# Usage: bash examples/skills_example.sh [url]
+# Skills extension (SEP-2640) walkthrough. Self-contained: starts its own
+# gateway on :4410 with the skills-enabled echo upstream, asserts every step,
+# and stops. Needs only a clone plus elixir on PATH.
+# Usage: bash examples/skills_example.sh   (override port with PORT=...)
 
 set -euo pipefail
-URL="${1:-http://localhost:4000/mcp}"
-CT='Content-Type: application/json'
-AC='Accept: application/json'
+cd "$(dirname "$0")/.."
 
-session=$(curl -s --max-time 20 -D - -o /tmp/mcp-skills-init.json -X POST "$URL" -H "$CT" -H "$AC" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}' \
-  | tr -d '\r' | grep -i '^mcp-session-id' | awk '{print $2}')
+port="${PORT:-4410}"
+url="http://localhost:$port/mcp"
+ct='Content-Type: application/json'
+ac='Accept: application/json'
+log=/tmp/mcp_skills_gw.log
+
+pass() { echo "PASS: $1"; }
+fail() { echo "FAIL: $1"; tail -5 "$log" 2>/dev/null; exit 1; }
+
+export PORT="$port"
+export MCP_UPSTREAMS="[{\"name\":\"echo\",\"command\":\"elixir\",\"args\":[\"$(pwd)/priv/fake_mcp_server.exs\"]}]"
+
+mix run --no-halt > "$log" 2>&1 &
+gw=$!
+trap 'kill $gw 2>/dev/null || true' EXIT
+
+for _ in $(seq 1 30); do
+  curl -sf --connect-timeout 1 --max-time 2 -o /dev/null "http://localhost:$port/health" && break
+  sleep 1
+done
 
 post() {
-  curl -s --max-time 30 -X POST "$URL" -H "$CT" -H "$AC" -H "Mcp-Session-Id: $session" \
+  curl -s --max-time 30 -X POST "$url" -H "$ct" -H "$ac" -H "Mcp-Session-Id: $session" \
     -d "{\"jsonrpc\":\"2.0\",\"id\":$1,\"method\":\"$2\",\"params\":$3}"
 }
 
-echo "== 1. initialize: gateway advertises the skills extension because an upstream serves skills"
-jq '.result.capabilities' /tmp/mcp-skills-init.json
+session=$(curl -s --max-time 20 -D - -o /tmp/mcp_skills_init.json -X POST "$url" -H "$ct" -H "$ac" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"example","version":"0"}}}' \
+  | tr -d '\r' | grep -i '^mcp-session-id' | awk '{print $2}')
+[ -n "$session" ] || fail "initialize: no session id"
 
-echo "== 2. skills/list: aggregated entries, URIs namespaced by server, manifests with digests"
-post 2 skills/list '{}' | jq '.result'
+echo "== 1. initialize advertises the extension because the echo upstream serves skills"
+jq -e '.result.capabilities.extensions["io.modelcontextprotocol/skills"]' /tmp/mcp_skills_init.json > /dev/null || fail "extension not advertised"
+pass "capability advertisement"
 
-echo "== 3. skills/get: one entry by URI (adjust echo__greet if your server name differs)"
-post 3 skills/get '{"uri":"skill://echo__greet/SKILL.md"}' | jq '.result.skill.frontmatter'
+echo "== 2. skills/list: namespaced URI + manifest with digests (queues through handshake)"
+post 2 skills/list '{}' > /tmp/mcp_skills_list.json
+jq -e '.result.skills[0].uri == "skill://echo__greet/SKILL.md"' /tmp/mcp_skills_list.json > /dev/null || fail "skills/list uri"
+jq -e '[.result.skills[0].resources[].digest] | all(startswith("sha256:"))' /tmp/mcp_skills_list.json > /dev/null || fail "manifest digests"
+pass "skills/list"
 
-echo "== 4. skills/get unknown: protocol error -32602, which is how clients stop loading"
-post 4 skills/get '{"uri":"skill://echo__does-not-exist/SKILL.md"}' | jq '.error'
+echo "== 3. skills/get known uri"
+post 3 skills/get '{"uri":"skill://echo__greet/SKILL.md"}' \
+  | jq -e '.result.skill.frontmatter.name == "echo__greet"' > /dev/null || fail "skills/get"
+pass "skills/get"
 
-echo "== 5. resources/read: skill content is served as a resource"
-post 5 resources/read '{"uri":"skill://echo__greet/references/usage.md"}' > /tmp/mcp-skills-read.json
-jq '.result.contents[0]' /tmp/mcp-skills-read.json
+echo "== 4. skills/get unknown uri is a -32602 protocol error"
+post 4 skills/get '{"uri":"skill://echo__nope/SKILL.md"}' \
+  | jq -e '.error.code == -32602' > /dev/null || fail "skills/get unknown"
+pass "unknown uri error"
 
-echo "== 6. integrity: the bytes just read must hash to the digest published in the manifest"
-post 6 skills/list '{}' > /tmp/mcp-skills-list.json
-python3 - <<'EOF'
+echo "== 5. resources/read bytes hash to the published digest"
+post 5 resources/read '{"uri":"skill://echo__greet/references/usage.md"}' > /tmp/mcp_skills_read.json
+jq -e '.result.contents[0].text | test("friendly tone")' /tmp/mcp_skills_read.json > /dev/null || fail "resources/read text"
+python3 - <<'PYEOF' || fail "digest verification"
 import json, hashlib
-read = json.load(open('/tmp/mcp-skills-read.json'))['result']['contents'][0]
-skills = json.load(open('/tmp/mcp-skills-list.json'))['result']['skills']
-published = next(f['digest'] for s in skills for f in s['resources'] if f['uri'] == read['uri'])
-computed = 'sha256:' + hashlib.sha256(read['text'].encode()).hexdigest()
-print(f'published: {published}')
-print(f'computed : {computed}')
-assert computed == published, 'DIGEST MISMATCH'
-print('DIGEST OK')
-EOF
+d = json.load(open('/tmp/mcp_skills_read.json'))
+c = d['result']['contents'][0]
+computed = 'sha256:' + hashlib.sha256(c['text'].encode()).hexdigest()
+listed = json.load(open('/tmp/mcp_skills_list.json'))['result']['skills'][0]['resources']
+published = next(f['digest'] for f in listed if f['uri'] == c['uri'])
+assert computed == published, f"{computed} != {published}"
+PYEOF
+pass "digest integrity"
 
-echo "== 7. resources/list: every skill file is cataloged"
-post 7 resources/list '{}' | jq '[.result.resources[].uri]'
+echo "== 6. resources/list catalogs every skill file"
+post 6 resources/list '{}' | jq -e '.result.resources | length == 2' > /dev/null || fail "resources/list"
+pass "resources/list"
 
+kill $gw; trap - EXIT
+rm -f /tmp/mcp_skills_init.json /tmp/mcp_skills_list.json /tmp/mcp_skills_read.json
 echo
-echo "SKILLS WALKTHROUGH COMPLETE"
+echo "ALL SKILLS CHECKS PASSED - extension advertised, aggregated, namespaced, digest-verified."

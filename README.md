@@ -41,6 +41,15 @@ termination. Every step must pass, or the script exits non-zero.
 bash examples/simple_example.sh
 ```
 
+`examples/skills_example.sh` does the same for the skills extension
+(SEP-2640): it starts its own gateway with the skills-enabled upstream and
+asserts advertisement, aggregation, namespacing, `-32602` on unknown URIs,
+and digest integrity of read bytes.
+
+```bash
+bash examples/skills_example.sh
+```
+
 ## Docker
 
 The image bundles the BEAM runtime plus Node.js, so `npx`-based MCP upstreams
