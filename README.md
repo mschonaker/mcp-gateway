@@ -53,34 +53,51 @@ bash examples/skills_example.sh
 ## Docker
 
 The image bundles the BEAM runtime plus Node.js, so `npx`-based MCP upstreams
-work with nothing else installed. The gateway listens on `8080`.
+work with nothing else installed. The gateway listens on `8080` inside the
+container; publish it as `4000` to match the examples and OpenCode configs.
+
+The gateway can only see what you mount, and the upstream is jailed to exactly
+those mount points:
+
+| On the host | In the container | Gateway sees |
+| ----------- | ---------------- | ------------ |
+| `$HOME/notes` | `/data` | allowed |
+| `.../mcp_gateway/demo` | `/demo` | allowed |
+| anything not mounted | invisible | rejected |
+
+So every path in a tool call is a **container path** (`/data/...`, `/demo/...`),
+never a host path, never `/tmp`. And the tool prefix is the upstream `name`:
+`files__read_text_file`.
+
+Canonical run — one filesystem server serving both jails:
+
+```bash
+docker run -it --rm -p 4000:8080 \
+  -v "$HOME/notes:/data" \
+  -v "$HOME/workspace/mcp_gateway/demo:/demo" \
+  -v "$HOME/.cache/mcp-npm:/home/app/.npm" \
+  -e MCP_UPSTREAMS='[{"name":"files","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/data","/demo"]}]' \
+  mcp-gateway:latest
+```
+
+`-v .../.npm` is an npm cache; without it the first call waits out a package
+download, with it restarts are instant. Then point your MCP client at
+`http://localhost:4000/mcp`.
 
 Run it straight from this repository, no clone (note the `.git` suffix — it
-is required, or Docker fetches the web page instead of the repo):
+is required, or Docker fetches the web page instead of the repo). Add the same
+`-v` and `-e` flags to get the jails above; without them the gateway starts
+with no upstreams and `tools/list` returns empty:
 
 ```bash
-docker run -it --rm -p 8080:8080 $(docker build -q https://github.com/mschonaker/mcp-gateway.git)
+docker run -it --rm -p 4000:8080 $(docker build -q https://github.com/mschonaker/mcp-gateway.git)
 ```
 
-Or pull the published multi-arch image (`linux/amd64`, `linux/arm64`):
-
-```bash
-docker run -it --rm -p 8080:8080 ghcr.io/mschonaker/mcp-gateway:latest
-```
-
-Then point your MCP client at `http://localhost:8080/mcp`.
-
-With an upstream mounted in, here a filesystem server jailed to `~/notes`:
-
-```bash
-docker run -it --rm -p 8080:8080 \
-  -v "$HOME/notes:/data" \
-  -e MCP_UPSTREAMS='[{"name":"files","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/data"]}]' \
-  ghcr.io/mschonaker/mcp-gateway:latest
-```
+If the ghcr package is made public, `ghcr.io/mschonaker/mcp-gateway:latest`
+works in place of the `$(docker build ...)` id.
 
 `MCP_UPSTREAMS` is the same JSON array described above. `PORT` changes the
-listen port. Build your own image with `docker build -t mcp-gateway .`.
+container listen port. Build your own image with `docker build -t mcp-gateway .`.
 
 Configure upstreams with the `MCP_UPSTREAMS` environment variable (a JSON
 array) or in `config/config.exs`:
@@ -93,6 +110,9 @@ MCP_UPSTREAMS='[
 ```
 
 `name` is the namespace prefix. `command` must be an executable on `PATH`.
+Paths in `args` are resolved where the gateway process runs: real host paths
+under `mix run`, mount points under Docker (see Docker below). `/tmp` works
+under `mix run` and means nothing to a container.
 
 ## Client configuration
 
@@ -119,6 +139,9 @@ Point any Streamable HTTP MCP client at the gateway:
 
 ## Curl walkthrough
 
+Matches the docker gateway of the Docker section above: prefix `files__`
+(from the upstream `name`), paths `/data` or `/demo` (the mounted jails).
+
 ```bash
 URL=http://localhost:4000/mcp
 
@@ -134,10 +157,10 @@ curl -s -X POST "$URL" -H 'Content-Type: application/json' -H 'Accept: applicati
   -H "Mcp-Session-Id: $session" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | jq
 
-# 3. call a tool on a specific upstream server
+# 3. write and read back inside the jail
 curl -s -X POST "$URL" -H 'Content-Type: application/json' -H 'Accept: application/json' \
   -H "Mcp-Session-Id: $session" \
-  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"filesystem__read_file","arguments":{"path":"/tmp/hello.txt"}}}' | jq
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"files__write_file","arguments":{"path":"/data/hello.txt","content":"hello\n"}}}' | jq
 
 # 4. end the session
 curl -s -X DELETE "$URL" -H "Mcp-Session-Id: $session" -o /dev/null -w '%{http_code}\n'
