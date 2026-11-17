@@ -98,7 +98,8 @@ Open the web UI at `http://localhost:4000`, sign in with Google, then:
 
 ## MCP surface
 
-- `initialize`, `ping`
+- `server/discover` (revision `2026-07-28`)
+- `initialize`, `ping` (revisions `2024-11-05` and `2025-03-26`)
 - `tools/list`, `tools/call`
   - Local: `local__whoami`, `local__datetime`
   - Remote: `<upstream>__<tool>` (subject to policy toggles); for a configured `geolocation` upstream: `geolocation__lookup_ipv4`, `geolocation__lookup_ipv6`

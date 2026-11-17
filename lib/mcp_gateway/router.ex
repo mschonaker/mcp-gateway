@@ -5,7 +5,10 @@ defmodule McpGateway.Router do
   alias McpGateway.{Auth.Google, Config, Local, Store, UpstreamHTTP}
 
   @protocol_version "2025-03-26"
-  @supported_versions ["2024-11-05", "2025-03-26"]
+  @legacy_versions ["2024-11-05", "2025-03-26"]
+  @modern_version "2026-07-28"
+  @supported_versions [@modern_version | @legacy_versions]
+  @cache %{"ttlMs" => 0, "cacheScope" => "private"}
   @server_info %{"name" => "mcp-gateway", "version" => "0.2.0"}
 
   plug Plug.Logger
@@ -220,7 +223,10 @@ defmodule McpGateway.Router do
       not Map.has_key?(body, "id") ->
         send_resp(conn, 202, "")
       true ->
-        send_mcp(conn, 200, dispatch_mcp(body, user))
+        case modern_version(body) do
+          v when v in [nil, @modern_version] -> send_mcp(conn, 200, dispatch_mcp(body, user))
+          version -> send_mcp(conn, 400, unsupported_version(body, version))
+        end
     end
   end
 
@@ -228,12 +234,18 @@ defmodule McpGateway.Router do
     params = params || %{}
     case method do
       "initialize" -> ok(id, %{"protocolVersion" => negotiated_version(params), "capabilities" => capabilities(), "serverInfo" => @server_info})
+      "server/discover" ->
+        ok(id, cached(%{
+          "supportedVersions" => @supported_versions,
+          "capabilities" => capabilities(),
+          "_meta" => %{"io.modelcontextprotocol/serverInfo" => @server_info}
+        }))
       "ping" -> ok(id, %{})
-      "tools/list" -> ok(id, %{"tools" => all_mcp_tools()})
+      "tools/list" -> ok(id, cached(%{"tools" => all_mcp_tools()}))
       "tools/call" -> call_mcp_tool(id, params, user)
       "skills/list" -> ok(id, %{"skills" => Local.list_skills()})
       "skills/get" -> mcp_skill_get(id, params)
-      "resources/list" -> ok(id, %{"resources" => skill_resources()})
+      "resources/list" -> ok(id, cached(%{"resources" => skill_resources()}))
       "resources/read" -> mcp_resource_read(id, params)
       _ -> err(id, -32601, "Method not found: #{method}")
     end
@@ -290,7 +302,7 @@ defmodule McpGateway.Router do
 
   defp mcp_resource_read(id, %{"uri" => uri}) do
     case Local.read_resource(uri) do
-      {:ok, contents} -> ok(id, %{"contents" => contents})
+      {:ok, contents} -> ok(id, cached(%{"contents" => contents}))
       {:error, _} -> err(id, -32602, "Unknown resource URI: #{uri}")
     end
   end
@@ -322,7 +334,16 @@ defmodule McpGateway.Router do
 
   defp negotiated_version(params) do
     v = params["protocolVersion"]
-    if v in @supported_versions, do: v, else: @protocol_version
+    if v in @legacy_versions, do: v, else: @protocol_version
+  end
+
+  defp modern_version(%{"params" => %{"_meta" => %{"io.modelcontextprotocol/protocolVersion" => v}}}) when is_binary(v), do: v
+  defp modern_version(_), do: nil
+
+  defp unsupported_version(body, version) do
+    %{"jsonrpc" => "2.0", "id" => body_id(body),
+      "error" => %{"code" => -32022, "message" => "Unsupported protocol version",
+                   "data" => %{"supported" => @supported_versions, "requested" => version}}}
   end
 
   # --- auth/helpers ---
@@ -377,7 +398,8 @@ defmodule McpGateway.Router do
     end
   end
 
-  defp ok(id, result), do: %{"jsonrpc" => "2.0", "id" => id, "result" => result}
+  defp ok(id, result), do: %{"jsonrpc" => "2.0", "id" => id, "result" => Map.put(result, "resultType", "complete")}
+  defp cached(result), do: Map.merge(result, @cache)
   defp err(id, code, msg), do: %{"jsonrpc" => "2.0", "id" => id, "error" => %{"code" => code, "message" => msg}}
   defp tool_error(msg), do: %{"content" => [%{"type" => "text", "text" => msg}], "isError" => true}
 

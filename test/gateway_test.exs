@@ -92,6 +92,52 @@ defmodule McpGateway.RouterTest do
     Store.set_allowed("fake", "echo", true)
   end
 
+  test "server/discover advertises the modern protocol version" do
+    conn =
+      post_mcp(%{
+        "jsonrpc" => "2.0",
+        "id" => 1,
+        "method" => "server/discover",
+        "params" => %{"_meta" => %{"io.modelcontextprotocol/protocolVersion" => "2026-07-28"}}
+      })
+
+    result = json(conn)["result"]
+    assert "2026-07-28" in result["supportedVersions"]
+    assert result["resultType"] == "complete"
+    assert result["ttlMs"] == 0
+    assert result["cacheScope"] == "private"
+    assert result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == "mcp-gateway"
+  end
+
+  test "modern results carry cache metadata" do
+    conn =
+      post_mcp(%{
+        "jsonrpc" => "2.0",
+        "id" => 1,
+        "method" => "tools/list",
+        "params" => %{"_meta" => %{"io.modelcontextprotocol/protocolVersion" => "2026-07-28"}}
+      })
+
+    result = json(conn)["result"]
+    assert result["resultType"] == "complete"
+    assert result["ttlMs"] == 0
+    assert result["cacheScope"] == "private"
+  end
+
+  test "unsupported modern protocol version is rejected" do
+    conn =
+      post_mcp(%{
+        "jsonrpc" => "2.0",
+        "id" => 1,
+        "method" => "tools/list",
+        "params" => %{"_meta" => %{"io.modelcontextprotocol/protocolVersion" => "1900-01-01"}}
+      })
+
+    assert conn.status == 400
+    assert json(conn)["error"]["code"] == -32022
+    assert "2026-07-28" in json(conn)["error"]["data"]["supported"]
+  end
+
   test "skills/list serves filesystem skills" do
     conn = post_mcp(%{"jsonrpc" => "2.0", "id" => 1, "method" => "skills/list"})
     uris = json(conn)["result"]["skills"] |> Enum.map(& &1["uri"])
