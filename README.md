@@ -1,204 +1,155 @@
 # MCP Gateway (Elixir)
 
-A reverse proxy and multiplexer for the Model Context Protocol. It exposes one
-Streamable HTTP endpoint to MCP clients (Claude Desktop, Cursor, and others)
-and aggregates tools from multiple upstream stdio MCP servers.
+An enterprise-oriented local MCP gateway that exposes **MCP over Streamable HTTP only** (input and output), uses **Google OIDC** for web login, keeps all runtime state **in memory** (no database), serves **SEP-2640 skills from the filesystem**, and provides local diagnostic tools.
 
-```mermaid
-flowchart LR
-    client[MCP client] -- "POST /mcp ▻ JSON-RPC / ◅ JSON or SSE" --> gateway[Elixir gateway]
-    gateway -- "stdio lines ▻ / ◅ JSON-RPC" --> fs[filesystem server ▸ npx]
-    gateway -- "stdio lines ▻ / ◅ JSON-RPC" --> mem[memory server ▸ npx]
-    gateway -- "stdio lines ▻ / ◅ JSON-RPC" --> ...[other upstreams ...]
-```
+## What it does
 
-The gateway performs the MCP handshake with every upstream at boot, caches
-each server's tool list, and namespaces the names as `<server>__<tool>`.
-Requests that arrive during a cold start (for example, `npx -y ...` downloads)
-are queued, not dropped.
+- **Input (clients → gateway):** Streamable HTTP MCP endpoint at `POST /mcp` (and SSE responses when requested), protected by a bearer token issued after web login.
+- **Output (gateway → upstream MCPs):** remote MCP servers over **Streamable HTTP only** (no stdio). Upstream auth modes: `none`, static `bearer`, or `oauth` tokens obtained from the web UI.
+- **Identity:** Google OIDC login for the web UI. Access is restricted by an allowlist file (default: `config/allowlist.txt`, currently `mschonaker@gmail.com`).
+- **No database:** sessions, MCP bearer tokens, upstream configs/tokens, and policy toggles live in memory and are lost on restart.
+- **Policy:** per-upstream, per-function allow/block toggles in the web UI. Default: **allowed (on)**.
+- **Local MCP tools:** `local__whoami` (diagnostic identity seen by gateway) and `local__datetime` (current UTC time in ISO 8601).
+- **Upstream example tools:** upstreams discovered through the web UI are exposed as `<upstream>__<tool>` (for a configured `geolocation` upstream: `geolocation__lookup_ipv4`, `geolocation__lookup_ipv6`).
+- **Skills:** SEP-2640 skills loaded from the local filesystem (`skills/` by default). Example skills included: `whoami-check` and `datetime-now`.
 
 ## Requirements
 
-- Elixir 1.16 or newer (OTP 26+).
-- Node.js, if you use `npx`-based upstreams.
+- Elixir 1.16+ / OTP 26+
+- A Google OAuth 2.0 / OIDC client (Web application) for local use
 
-## Build and run
+## Configuration
+
+Environment variables:
+
+- `PORT` - HTTP port (default `4000`)
+- `BASE_URL` - public/local base URL used for OAuth callbacks (default `http://localhost:4000`)
+- `GOOGLE_CLIENT_ID` - Google OAuth client ID
+- `GOOGLE_CLIENT_SECRET` - Google OAuth client secret
+- `ALLOWLIST_PATH` - path to allowlist file (default `config/allowlist.txt`)
+- `SKILLS_DIR` - path to skills directory (default `skills/`)
+
+### Google OIDC setup (local, step by step)
+
+The gateway uses a **Web application** OAuth client with the authorization-code flow. Do this once.
+
+**1. Create/select a Google Cloud project**
+- Open https://console.cloud.google.com/ and select or create a project (e.g. `mcp-gateway`).
+
+**2. Configure the OAuth consent screen**
+- Go to **APIs & Services → OAuth consent screen**.
+- Choose **External** for a personal Gmail account (or **Internal** for a Google Workspace org).
+- Fill app name, user support email, and developer contact email. Save.
+- Add your email under **Test users** if the app is in **Testing** (e.g. `mschonaker@gmail.com`).
+
+**3. Create the OAuth client ID**
+- Go to **APIs & Services → Credentials → + Create Credentials → OAuth client ID**.
+- Application type: **Web application**.
+- **Authorized JavaScript origins:** `http://localhost:4000` (origin only: no path, no trailing `/`).
+- **Authorized redirect URIs:** `http://localhost:4000/auth/google/callback` (full path, exact).
+- Click **Create** and copy the **Client ID** and **Client secret**.
+
+**4. Start the gateway with the real values**
+```bash
+docker run --rm -p 4000:8080 \
+  -e PORT=8080 \
+  -e BASE_URL=http://localhost:4000 \
+  -e GOOGLE_CLIENT_ID="<your-id>.apps.googleusercontent.com" \
+  -e GOOGLE_CLIENT_SECRET="<your-secret>" \
+  mcp-gateway:local
+```
+or with `mix run`:
+```bash
+GOOGLE_CLIENT_ID="<your-id>.apps.googleusercontent.com" \
+GOOGLE_CLIENT_SECRET="<your-secret>" \
+BASE_URL=http://localhost:4000 mix run --no-halt
+```
+
+**5. Sign in**
+- Open `http://localhost:4000`, click **Sign in with Google**, and use an allowlisted email (`config/allowlist.txt`, default `mschonaker@gmail.com`).
+- The dashboard shows the MCP bearer token for this session.
+
+**OIDC troubleshooting**
+
+- **`Error 401: invalid_client`** — the client ID/secret pair is not a real registered pair. Placeholders such as `"your-google-client-id"` cause this. Use the exact values from the **Web application** client, with no extra quotes/spaces/newlines. If the secret was rotated or the client deleted, create a new client.
+- **`Invalid Origin: URIs must not contain a path or end with "/"`** — a callback URL was pasted into **Authorized JavaScript origins**. Put `http://localhost:4000` there (or leave it empty) and put the full `http://localhost:4000/auth/google/callback` in **Authorized redirect URIs**.
+- **`redirect_uri_mismatch`** — the redirect URI in Google and the gateway's `BASE_URL + /auth/google/callback` must match exactly (scheme, host, port, path, no trailing slash).
+- **`Access blocked` / consent errors** — app in **Testing** requires the account to be a **Test user**; or complete the consent-screen setup for the project.
+- **Gateway says `Email not allowed: ...`** — add that email to the allowlist file and restart the gateway (the allowlist is loaded at boot).
+- **Ports:** keep the host port, `BASE_URL`, and Google redirect URI consistent. The container listens on `PORT` (`8080` in the image), while `-p 4000:8080` exposes it as `4000`.
+
+## Run locally
 
 ```bash
 mix deps.get
-mix test
-mix run --no-halt
+GOOGLE_CLIENT_ID="<your-id>.apps.googleusercontent.com" \
+GOOGLE_CLIENT_SECRET="<your-secret>" \
+BASE_URL=http://localhost:4000 mix run --no-halt
 ```
 
-## Simple example
+Open the web UI at `http://localhost:4000`, sign in with Google, then:
 
-`examples/simple_example.sh` compiles every environment, builds the release,
-boots it with one stdio upstream, and asserts the whole path: handshake,
-session, `tools/list`, `tools/call`, SSE framing, notifications, and session
-termination. Every step must pass, or the script exits non-zero.
+- Copy the **MCP bearer token** shown on the dashboard and configure your MCP client with:
+  - URL: `http://localhost:4000/mcp`
+  - Header: `Authorization: Bearer <token>`
+- Add upstream MCP servers (Streamable HTTP URLs), choose auth mode (none/bearer), refresh tools, and use toggles to allow/block functions.
+- For upstream OAuth: save OAuth config in the upstream card and click **Connect OAuth** (flow runs in the browser; tokens stored in memory only). Callback: `BASE_URL/auth/upstream/callback`.
+- Add skills by copying skill folders (with `SKILL.md`) into `SKILLS_DIR`.
+
+## MCP surface
+
+- `initialize`, `ping`
+- `tools/list`, `tools/call`
+  - Local: `local__whoami`, `local__datetime`
+  - Remote: `<upstream>__<tool>` (subject to policy toggles); for a configured `geolocation` upstream: `geolocation__lookup_ipv4`, `geolocation__lookup_ipv6`
+- `skills/list`, `skills/get` (SEP-2640, filesystem)
+- `resources/list`, `resources/read` (skill files)
+
+## Notes
+
+- Runtime state is in-memory only; restart clears sessions, tokens, upstreams, and toggles.
+- Upstream OAuth acquisition is initiated only from the web UI, never from MCP requests.
+- This is a local-first implementation intended to be hardened further for production deployments.
+
+## Run with Docker
+
+Complete **Google OIDC setup (local, step by step)** first, then build in `mcp_gateway/`:
 
 ```bash
-bash examples/simple_example.sh
+docker build -t mcp-gateway:local .
 ```
 
-`examples/skills_example.sh` does the same for the skills extension
-(SEP-2640): it starts its own gateway with the skills-enabled upstream and
-asserts advertisement, aggregation, namespacing, `-32602` on unknown URIs,
-and digest integrity of read bytes.
+Run locally (container listens on `8080`, mapped to host `4000`):
 
 ```bash
-bash examples/skills_example.sh
+docker run --rm -p 4000:8080 \
+  -e PORT=8080 \
+  -e BASE_URL=http://localhost:4000 \
+  -e GOOGLE_CLIENT_ID="<your-id>.apps.googleusercontent.com" \
+  -e GOOGLE_CLIENT_SECRET="<your-secret>" \
+  mcp-gateway:local
 ```
 
-## Docker
+Open `http://localhost:4000`, sign in with Google, and copy the MCP bearer token from the dashboard for your MCP client:
 
-The image bundles the BEAM runtime plus Node.js, so `npx`-based MCP upstreams
-work with nothing else installed. The gateway listens on `8080` inside the
-container; publish it as `4000` to match the examples and OpenCode configs.
+- URL: `http://localhost:4000/mcp`
+- Header: `Authorization: Bearer <token>`
 
-The gateway can only see what you mount, and the upstream is jailed to exactly
-those mount points:
+`BASE_URL` must be the exact browser-facing URL you use and must match the OAuth redirect URIs registered in Google (`$BASE_URL/auth/google/callback`) and, if used, in upstream providers (`$BASE_URL/auth/upstream/callback`).
 
-| On the host | In the container | Gateway sees |
-| ----------- | ---------------- | ------------ |
-| `$HOME/notes` | `/data` | allowed |
-| `.../mcp_gateway/demo` | `/demo` | allowed |
-| anything not mounted | invisible | rejected |
-
-So every path in a tool call is a **container path** (`/data/...`, `/demo/...`),
-never a host path, never `/tmp`. And the tool prefix is the upstream `name`:
-`files__read_text_file`.
-
-Canonical run — one filesystem server serving both jails:
+Override allowlist/skills by mounting files and setting paths:
 
 ```bash
-docker run -it --rm -p 4000:8080 \
-  -v "$HOME/notes:/data" \
-  -v "$HOME/workspace/mcp_gateway/demo:/demo" \
-  -v "$HOME/.cache/mcp-npm:/home/app/.npm" \
-  -e MCP_UPSTREAMS='[{"name":"files","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/data","/demo"]}]' \
-  mcp-gateway:latest
+docker run --rm -p 4000:8080 \
+  -e PORT=8080 \
+  -e BASE_URL=http://localhost:4000 \
+  -e GOOGLE_CLIENT_ID="..." \
+  -e GOOGLE_CLIENT_SECRET="..." \
+  -e ALLOWLIST_PATH=/data/allowlist.txt \
+  -e SKILLS_DIR=/data/skills \
+  -v "$PWD/config/allowlist.txt:/data/allowlist.txt:ro" \
+  -v "$PWD/skills:/data/skills:ro" \
+  mcp-gateway:local
 ```
 
-`-v .../.npm` is an npm cache; without it the first call waits out a package
-download, with it restarts are instant. Then point your MCP client at
-`http://localhost:4000/mcp`.
-
-Run it straight from this repository, no clone (note the `.git` suffix — it
-is required, or Docker fetches the web page instead of the repo). Add the same
-`-v` and `-e` flags to get the jails above; without them the gateway starts
-with no upstreams and `tools/list` returns empty:
-
-```bash
-docker run -it --rm -p 4000:8080 $(docker build -q https://github.com/mschonaker/mcp-gateway.git)
-```
-
-If the ghcr package is made public, `ghcr.io/mschonaker/mcp-gateway:latest`
-works in place of the `$(docker build ...)` id.
-
-`MCP_UPSTREAMS` is the same JSON array described above. `PORT` changes the
-container listen port. Build your own image with `docker build -t mcp-gateway .`.
-
-Configure upstreams with the `MCP_UPSTREAMS` environment variable (a JSON
-array) or in `config/config.exs`:
-
-```bash
-MCP_UPSTREAMS='[
-  {"name": "filesystem", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]},
-  {"name": "memory", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-memory"]}
-]' PORT=4000 mix run --no-halt
-```
-
-`name` is the namespace prefix. `command` must be an executable on `PATH`.
-Paths in `args` are resolved where the gateway process runs: real host paths
-under `mix run`, mount points under Docker (see Docker below). `/tmp` works
-under `mix run` and means nothing to a container.
-
-## Client configuration
-
-Point any Streamable HTTP MCP client at the gateway:
-
-```json
-{
-  "mcpServers": {
-    "gateway": {
-      "url": "http://localhost:4000/mcp"
-    }
-  }
-}
-```
-
-## Endpoints
-
-| Route        | Method   | Purpose                                        |
-| ------------ | -------- | ---------------------------------------------- |
-| `/mcp`       | POST     | JSON-RPC 2.0. Replies JSON, or SSE if accepted |
-| `/mcp`       | DELETE   | Terminate the session (needs `Mcp-Session-Id`) |
-| `/mcp`       | GET      | 405. The gateway has no server-initiated stream |
-| `/health`    | GET      | Liveness probe                                 |
-
-## Curl walkthrough
-
-Matches the docker gateway of the Docker section above: prefix `files__`
-(from the upstream `name`), paths `/data` or `/demo` (the mounted jails).
-
-```bash
-URL=http://localhost:4000/mcp
-
-# 1. initialize and capture the session id
-session=$(curl -s -D - -o /dev/null -X POST "$URL" \
-  -H 'Content-Type: application/json' \
-  -H 'Accept: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}' \
-  | grep -i mcp-session-id | tr -d '\r' | awk '{print $2}')
-
-# 2. list all aggregated, namespaced tools
-curl -s -X POST "$URL" -H 'Content-Type: application/json' -H 'Accept: application/json' \
-  -H "Mcp-Session-Id: $session" \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | jq
-
-# 3. write and read back inside the jail
-curl -s -X POST "$URL" -H 'Content-Type: application/json' -H 'Accept: application/json' \
-  -H "Mcp-Session-Id: $session" \
-  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"files__write_file","arguments":{"path":"/data/hello.txt","content":"hello\n"}}}' | jq
-
-# 4. end the session
-curl -s -X DELETE "$URL" -H "Mcp-Session-Id: $session" -o /dev/null -w '%{http_code}\n'
-```
-
-## Modules
-
-| File                             | Role                                                              |
-| -------------------------------- | ----------------------------------------------------------------- |
-| `lib/mcp_gateway/application.ex` | Supervision tree. Starts Bandit and configured upstreams.          |
-| `lib/mcp_gateway/router.ex`      | Streamable HTTP endpoint. Session handling and RPC multiplexing.   |
-| `lib/mcp_gateway/upstream.ex`    | GenServer per stdio server. Handshake, tool cache, call proxying.  |
-| `lib/mcp_gateway/skills.ex`      | URI namespacing for the skills extension (SEP-2640).               |
-| `lib/mcp_gateway/sessions.ex`    | `Mcp-Session-Id` registry (in-memory).                             |
-| `priv/fake_mcp_server.exs`       | Fake upstream used by the test suite.                              |
-
-## Skills (SEP-2640)
-
-Upstream servers that declare the `io.modelcontextprotocol/skills` extension
-are fetched at handshake. The gateway aggregates them, rewrites each skill URI
-to `skill://<server>__<name>/...` so servers cannot collide, forwards
-`skills/get` and `resources/read` with the original URI, and rewrites the URIs
-back on the way down. Published SHA-256 digests still verify, because content
-passes through byte for byte. The gateway advertises the extension only while
-some upstream actually serves skills.
-
-Client support for the extension is still rolling out. See
-[docs/sep-2640-status.md](docs/sep-2640-status.md) for the ecosystem status
-as of 2026-11-15.
-
-## Known limitations
-
-- Upstream transport is stdio only. Remote HTTP/SSE upstreams are not proxied.
-- Skill URIs are namespaced with `__`, so an upstream server name must not
-  contain `__` (same constraint as tool names).
-- Sessions live in one node's memory. They do not survive a restart and are
-  not shared across nodes.
-- No authentication, rate limiting, or per-tool ACLs. Put the gateway behind
-  a reverse proxy or add a Plug if you expose it.
-- Server-initiated messages (SSE GET stream, sampling, roots) are rejected
-  upstream and not offered downstream.
+All runtime state (sessions, MCP bearer token, upstream configs/tokens, toggles) is in-memory and lost on container restart.

@@ -8,7 +8,6 @@ test
 *.log
 erl_crash.dump
 demo
-README.md
+.elixir_ls
 .formatter.exs
 .gitignore
-Dockerfile
