@@ -206,6 +206,21 @@ defmodule McpGateway.Router do
     send_resp(conn, 405, "")
   end
 
+  get "/skills/index.json" do
+    send_json(conn, 200, %{"skills" => Local.catalog()})
+  end
+
+  get "/skills/:skill/*path" do
+    case Local.read_resource("skill://" <> Path.join(skill, path)) do
+      {:ok, [%{"mimeType" => mime} = content | _]} ->
+        body = content["text"] || Base.decode64!(content["blob"])
+        conn |> put_resp_content_type(mime) |> send_resp(200, body)
+
+      {:error, :not_found} ->
+        send_resp(conn, 404, "Not Found")
+    end
+  end
+
   get "/health" do
     send_resp(conn, 200, "ok")
   end
@@ -243,7 +258,7 @@ defmodule McpGateway.Router do
       "ping" -> ok(id, %{})
       "tools/list" -> ok(id, cached(%{"tools" => all_mcp_tools()}))
       "tools/call" -> call_mcp_tool(id, params, user)
-      "skills/list" -> ok(id, %{"skills" => Local.list_skills()})
+      "skills/list" -> ok(id, cached(%{"skills" => Local.list_skills()}))
       "skills/get" -> mcp_skill_get(id, params)
       "resources/list" -> ok(id, cached(%{"resources" => skill_resources()}))
       "resources/read" -> mcp_resource_read(id, params)
@@ -294,7 +309,7 @@ defmodule McpGateway.Router do
 
   defp mcp_skill_get(id, %{"uri" => uri}) do
     case Local.get_skill(uri) do
-      {:ok, skill} -> ok(id, %{"skill" => skill})
+      {:ok, skill} -> ok(id, cached(%{"skill" => skill}))
       {:error, _} -> err(id, -32602, "Unknown skill URI: #{uri}")
     end
   end

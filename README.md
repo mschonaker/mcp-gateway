@@ -106,6 +106,30 @@ Open the web UI at `http://localhost:4000`, sign in with Google, then:
 - `skills/list`, `skills/get` (SEP-2640, filesystem)
 - `resources/list`, `resources/read` (skill files)
 
+## OpenCode skill catalog
+
+SEP-2640 needs client support that no released agent has yet, so the gateway also serves the
+skill files as an OpenCode HTTP skill catalog. This is not part of MCP. OpenCode fetches the
+index with no credentials, so these two routes are unauthenticated by design:
+
+```
+GET /skills/index.json          # {"skills": [{"name", "version", "files"}]}
+GET /skills/<name>/<file>       # raw file bytes
+```
+
+`version` is the comma-joined SHA-256 digests of the skill files. OpenCode stores it in
+`.opencode-version` and re-downloads the whole skill when it changes. Point a client at the
+catalog by adding it to `opencode.json`:
+
+```json
+{
+  "skills": ["http://localhost:4000/skills/"]
+}
+```
+
+Remove this section, and the routes in `Router`, once the client implements
+`io.modelcontextprotocol/skills` natively.
+
 ## Notes
 
 - Runtime state is in-memory only; restart clears sessions, tokens, upstreams, and toggles.

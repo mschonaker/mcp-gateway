@@ -156,6 +156,35 @@ defmodule McpGateway.RouterTest do
     assert json(conn)["result"]["skill"]["uri"] == "skill://whoami-check/SKILL.md"
   end
 
+  test "skills/list carries cache metadata" do
+    conn = post_mcp(%{"jsonrpc" => "2.0", "id" => 1, "method" => "skills/list"})
+    result = json(conn)["result"]
+    assert result["resultType"] == "complete"
+    assert result["ttlMs"] == 0
+    assert result["cacheScope"] == "private"
+  end
+
+  test "skill catalog index lists skills with a version and files" do
+    conn = get_public("/skills/index.json")
+    assert conn.status == 200
+
+    entry = json(conn)["skills"] |> Enum.find(&(&1["name"] == "datetime-now"))
+    assert "SKILL.md" in entry["files"]
+    assert is_binary(entry["version"])
+  end
+
+  test "skill catalog serves a skill file without authentication" do
+    conn = get_public("/skills/datetime-now/SKILL.md")
+    assert conn.status == 200
+    assert conn.resp_body =~ "name: datetime-now"
+  end
+
+  test "skill catalog rejects paths outside the skills directory" do
+    assert get_public("/skills/datetime-now/../../config/allowlist.txt").status == 404
+  end
+
+  defp get_public(path), do: conn(:get, path) |> Router.call(Router.init([]))
+
   defp post_mcp(body, headers \\ [{"authorization", "Bearer #{@token}"}]) do
     conn(:post, "/mcp", Jason.encode!(body))
     |> put_req_header("content-type", "application/json")

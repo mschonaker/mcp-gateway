@@ -98,6 +98,28 @@ defmodule McpGateway.Local do
     end
   end
 
+  def catalog do
+    skills_dir()
+    |> list_skill_dirs()
+    |> Enum.map(&catalog_entry/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.sort_by(& &1["name"])
+  end
+
+  defp catalog_entry(dir) do
+    case load_skill(dir) do
+      nil ->
+        nil
+
+      skill ->
+        %{
+          "name" => Path.basename(dir),
+          "version" => skill["resources"] |> Enum.map(& &1["digest"]) |> Enum.join(","),
+          "files" => Enum.map(skill["resources"], & &1["name"])
+        }
+    end
+  end
+
   defp skills_dir, do: Config.skills_dir()
 
   defp list_skill_dirs(dir) do
@@ -152,23 +174,19 @@ defmodule McpGateway.Local do
 
   defp parse_frontmatter(text, fallback_name) do
     case Regex.run(~r/\A---\s*\n(.*?)\n---\s*\n?(.*)\z/s, text) do
-      [_, yaml, body] ->
-        fm = %{
-          "name" => yaml_value(yaml, "name") || fallback_name,
-          "description" => yaml_value(yaml, "description") || ""
-        }
-        {fm, body}
-
-      _ ->
-        {%{"name" => fallback_name, "description" => ""}, text}
+      [_, yaml, body] -> {frontmatter_fields(yaml, fallback_name), body}
+      _ -> {%{"name" => fallback_name, "description" => ""}, text}
     end
   end
 
-  defp yaml_value(yaml, key) do
-    case Regex.run(~r/^\s*#{Regex.escape(key)}\s*:\s*(.+)\s*$/m, yaml) do
-      [_, value] -> String.trim(value, "\"'")
-      _ -> nil
-    end
+  defp frontmatter_fields(yaml, fallback_name) do
+    fields =
+      Regex.scan(~r/^([A-Za-z0-9_-]+):[ \t]*(.*?)[ \t]*$/m, yaml)
+      |> Enum.map(fn [_, key, value] -> {key, String.trim(value, "\"'")} end)
+      |> Enum.reject(fn {_key, value} -> value == "" end)
+      |> Map.new()
+
+    Map.put_new(fields, "name", fallback_name)
   end
 
   defp uri_to_path("skill://" <> rest) do
