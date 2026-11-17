@@ -442,7 +442,14 @@ defmodule McpGateway.Router do
     input,select{padding:6px;margin:2px} button{padding:6px 10px;margin:2px;cursor:pointer}
     .muted{color:#666;font-size:13px} .ok{color:#0a7} .err{color:#c33} code{background:#f2f2f2;padding:2px 4px;border-radius:4px}
     .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-    </style></head><body>#{inner}</body></html>
+    .harness>input{display:none}
+    .tabs{display:flex;gap:6px;flex-wrap:wrap;margin:12px 0 6px}
+    .tabs label{padding:6px 10px;border:1px solid #ddd;border-radius:6px;background:#f4f4f4;cursor:pointer;font-size:13px}
+    #tab-opencode:checked~.tabs label[for=tab-opencode],#tab-codex:checked~.tabs label[for=tab-codex],#tab-claude:checked~.tabs label[for=tab-claude],#tab-copilot:checked~.tabs label[for=tab-copilot],#tab-gemini:checked~.tabs label[for=tab-gemini]{background:#111;color:#fff;border-color:#111}
+    .pane{display:none}
+    #tab-opencode:checked~.panes #pane-opencode,#tab-codex:checked~.panes #pane-codex,#tab-claude:checked~.panes #pane-claude,#tab-copilot:checked~.panes #pane-copilot,#tab-gemini:checked~.panes #pane-gemini{display:block}
+    textarea.cmd{width:100%;box-sizing:border-box;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;padding:10px;border:1px solid #ddd;border-radius:6px;background:#f7f7f7;color:#111}
+    </style></head><body>#{inner}<script>document.addEventListener("click",function(e){var b=e.target.closest("button[data-copy]");if(b){var t=document.getElementById("cmd-"+b.dataset.copy);if(t&&navigator.clipboard)navigator.clipboard.writeText(t.value)}});</script></body></html>
     """
   end
 
@@ -467,7 +474,8 @@ defmodule McpGateway.Router do
     <div class="card"><h2>MCP Access</h2>
       <p>Endpoint: <code>#{esc(Config.base_url())}/mcp</code> (Streamable HTTP, bearer token required)</p>
       <p>Bearer token for this session: <code>#{esc(user.mcp_token || "")}</code></p>
-      <p class="muted">Use as <code>Authorization: Bearer &lt;token&gt;</code>. Token is in-memory and invalid after logout/restart.</p></div>
+      <p class="muted">Use as <code>Authorization: Bearer &lt;token&gt;</code>. Token is in-memory and invalid after logout/restart.</p>
+      #{harness_setup_html(Config.base_url() <> "/mcp", user.mcp_token || "")}</div>
 
     <div class="card"><h2>Local MCP Tools</h2>
       <ul><li><code>local__whoami</code> - diagnostic identity (MCP tool)</li><li><code>local__datetime</code> - current date/time (MCP tool)</li></ul></div>
@@ -489,6 +497,38 @@ defmodule McpGateway.Router do
     #{Enum.map_join(upstreams, "", &upstream_card/1)}
     """)
   end
+
+  defp harness_setup_html(endpoint, token) do
+    url = shell_quote(endpoint)
+    auth = shell_quote("Authorization: Bearer #{token}")
+
+    commands = [
+      {"opencode", "OpenCode", "opencode mcp add gateway --url #{url} --header #{shell_quote("Authorization=Bearer #{token}")}"},
+      {"codex", "Codex", "export MCP_GATEWAY_TOKEN=#{shell_quote(token)}\ncodex mcp add gateway --url #{url} --bearer-token-env-var MCP_GATEWAY_TOKEN"},
+      {"claude", "Claude Code", "claude mcp add --transport http gateway #{url} --header #{auth}"},
+      {"copilot", "GitHub Copilot", "copilot mcp add --transport http --header #{auth} gateway #{url}"},
+      {"gemini", "Gemini CLI", "gemini mcp add --transport http --header #{auth} gateway #{url}"}
+    ]
+
+    radios =
+      Enum.map_join(commands, "", fn {id, _label, _command} ->
+        checked = if id == "opencode", do: " checked", else: ""
+        ~s(<input type="radio" name="harness" id="tab-#{id}"#{checked}>)
+      end)
+
+    tabs = Enum.map_join(commands, "", fn {id, label, _command} -> ~s(<label for="tab-#{id}">#{label}</label>) end)
+
+    panes =
+      Enum.map_join(commands, "", fn {id, _label, command} ->
+        ~s(<div class="pane" id="pane-#{id}"><button type="button" data-copy="#{id}">Copy</button><textarea class="cmd" id="cmd-#{id}" rows="2" readonly>#{esc(command)}</textarea></div>)
+      end)
+
+    """
+    <div class="harness">#{radios}<div class="tabs">#{tabs}</div><div class="panes">#{panes}</div></div>
+    """
+  end
+
+  defp shell_quote(value), do: "'" <> String.replace(to_string(value), "'", "'\\''") <> "'"
 
   defp upstream_card(up) do
     tools = Store.get_tools(up.name)

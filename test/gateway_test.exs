@@ -156,6 +156,31 @@ defmodule McpGateway.RouterTest do
     assert json(conn)["result"]["skill"]["uri"] == "skill://whoami-check/SKILL.md"
   end
 
+  test "dashboard shows harness setup commands" do
+    session_id = "test-web-session"
+
+    Store.put_web_session(session_id, %{
+      email: "mschonaker@gmail.com",
+      subject: "test-subject",
+      mcp_token: @token,
+      created_at: 0
+    })
+
+    on_exit(fn -> Store.delete_web_session(session_id) end)
+
+    conn =
+      conn(:get, "/")
+      |> put_req_cookie("gw_session", session_id)
+      |> Router.call(Router.init([]))
+
+    assert conn.status == 200
+    assert conn.resp_body =~ "opencode mcp add gateway"
+    assert conn.resp_body =~ "codex mcp add gateway"
+    assert conn.resp_body =~ "claude mcp add --transport http gateway"
+    assert conn.resp_body =~ "copilot mcp add --transport http"
+    assert conn.resp_body =~ "gemini mcp add --transport http"
+  end
+
   defp post_mcp(body, headers \\ [{"authorization", "Bearer #{@token}"}]) do
     conn(:post, "/mcp", Jason.encode!(body))
     |> put_req_header("content-type", "application/json")
