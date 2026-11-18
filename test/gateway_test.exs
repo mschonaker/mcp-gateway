@@ -92,6 +92,48 @@ defmodule McpGateway.RouterTest do
     Store.set_allowed("fake", "echo", true)
   end
 
+  test "blocked local tools do not execute" do
+    Store.set_allowed("local:tools", "whoami", false)
+    on_exit(fn -> Store.set_allowed("local:tools", "whoami", true) end)
+
+    conn =
+      post_mcp(%{
+        "jsonrpc" => "2.0",
+        "id" => 1,
+        "method" => "tools/call",
+        "params" => %{"name" => "local__whoami", "arguments" => %{}}
+      })
+
+    result = json(conn)["result"]
+    assert result["isError"] == true
+    assert hd(result["content"])["text"] =~ "blocked by policy"
+  end
+
+  test "blocked skills are hidden and cannot be read" do
+    uri = "skill://whoami-check/SKILL.md"
+    Store.set_allowed("local:skills", "whoami-check", false)
+    on_exit(fn -> Store.set_allowed("local:skills", "whoami-check", true) end)
+
+    conn = post_mcp(%{"jsonrpc" => "2.0", "id" => 1, "method" => "skills/list"})
+    refute uri in (json(conn)["result"]["skills"] |> Enum.map(& &1["uri"]))
+
+    conn = post_mcp(%{"jsonrpc" => "2.0", "id" => 1, "method" => "resources/list"})
+    uris = json(conn)["result"]["resources"] |> Enum.map(& &1["uri"])
+    refute Enum.any?(uris, &String.starts_with?(&1, "skill://whoami-check/"))
+
+    for method <- ["skills/get", "resources/read"] do
+      conn =
+        post_mcp(%{
+          "jsonrpc" => "2.0",
+          "id" => 1,
+          "method" => method,
+          "params" => %{"uri" => uri}
+        })
+
+      assert json(conn)["error"]["message"] =~ "blocked by policy"
+    end
+  end
+
   test "server/discover advertises the modern protocol version" do
     conn =
       post_mcp(%{
@@ -157,6 +199,85 @@ defmodule McpGateway.RouterTest do
   end
 
   test "dashboard shows harness setup commands" do
+    Store.put_upstream("fake", %{
+      name: "fake",
+      url: "http://localhost:1/mcp",
+      auth: %{type: "none"},
+      status: "connected",
+      mcp_session_id: nil,
+      oauth: %{client_secret: "top-secret"}
+    })
+
+    conn = web_request(:get, "/")
+
+    assert conn.status == 200
+    assert conn.resp_body =~ "opencode mcp add gateway --global"
+    assert conn.resp_body =~ "codex mcp add gateway"
+    assert conn.resp_body =~ "claude mcp add --transport http gateway"
+    assert conn.resp_body =~ "copilot mcp add --transport http"
+    assert conn.resp_body =~ "gemini mcp add --transport http"
+
+    card = conn.resp_body |> String.split("</div>") |> Enum.find(&String.contains?(&1, "Local MCP Tools"))
+    assert card != nil
+    assert card =~ "Add / Update Upstream MCP (HTTP)"
+    assert card =~ "Upstream: fake"
+    assert conn.resp_body =~ ~r(name="upstream" value="local:tools")
+    assert conn.resp_body =~ ~r(name="upstream" value="local:skills")
+    assert conn.resp_body =~ "skill://whoami-check/SKILL.md"
+    refute conn.resp_body =~ "top-secret"
+  end
+
+  test "upstream OAuth start sends a PKCE challenge" do
+    Store.put_upstream("fake", %{
+      name: "fake",
+      url: "https://api.githubcopilot.com/mcp/",
+      auth: %{type: "none"},
+      status: "configured",
+      mcp_session_id: nil,
+      oauth: %{auth_url: "https://github.com/login/oauth/authorize", client_id: "cid"}
+    })
+
+    conn = web_request(:post, "/ui/upstreams/fake/oauth/start")
+    assert conn.status == 302
+
+    location = conn |> get_resp_header("location") |> hd()
+    query = location |> URI.parse() |> Map.fetch!(:query) |> URI.decode_query()
+    assert query["code_challenge_method"] == "S256"
+
+    saved = Store.pop_upstream_oauth_state(query["state"])
+    assert saved.upstream == "fake"
+    assert byte_size(saved.verifier) == 43
+
+    expected = :crypto.hash(:sha256, saved.verifier) |> Base.url_encode64(padding: false)
+    assert query["code_challenge"] == expected
+  end
+
+  test "saving OAuth config keeps the stored secret and existing auth" do
+    Store.put_upstream("fake", %{
+      name: "fake",
+      url: "https://api.githubcopilot.com/mcp/",
+      auth: %{type: "oauth", access_token: "old-token"},
+      status: "oauth connected",
+      mcp_session_id: nil,
+      oauth: %{client_secret: "top-secret"}
+    })
+
+    conn =
+      web_request(:post, "/ui/upstreams/fake/oauth/config", %{
+        "oauth_auth_url" => "https://github.com/login/oauth/authorize",
+        "oauth_token_url" => "https://github.com/login/oauth/access_token",
+        "oauth_client_id" => "cid",
+        "oauth_client_secret" => "",
+        "oauth_scope" => "repo read:user"
+      })
+
+    assert conn.status == 302
+    up = Store.get_upstream("fake")
+    assert up.oauth.client_secret == "top-secret"
+    assert up.auth == %{type: "oauth", access_token: "old-token"}
+  end
+
+  defp web_request(method, path, params \\ nil) do
     session_id = "test-web-session"
 
     Store.put_web_session(session_id, %{
@@ -168,17 +289,8 @@ defmodule McpGateway.RouterTest do
 
     on_exit(fn -> Store.delete_web_session(session_id) end)
 
-    conn =
-      conn(:get, "/")
-      |> put_req_cookie("gw_session", session_id)
-      |> Router.call(Router.init([]))
-
-    assert conn.status == 200
-    assert conn.resp_body =~ "opencode mcp add gateway"
-    assert conn.resp_body =~ "codex mcp add gateway"
-    assert conn.resp_body =~ "claude mcp add --transport http gateway"
-    assert conn.resp_body =~ "copilot mcp add --transport http"
-    assert conn.resp_body =~ "gemini mcp add --transport http"
+    conn = if params, do: conn(method, path, params), else: conn(method, path)
+    conn |> put_req_cookie("gw_session", session_id) |> Router.call(Router.init([]))
   end
 
   defp post_mcp(body, headers \\ [{"authorization", "Bearer #{@token}"}]) do

@@ -182,8 +182,8 @@ defmodule McpGateway.Local do
   end
   defp uri_to_path(_), do: :error
 
-  defp skill_name_from_uri("skill://" <> rest), do: rest |> String.split("/", parts: 2) |> hd()
-  defp skill_name_from_uri(_), do: nil
+  def skill_name_from_uri("skill://" <> rest), do: rest |> String.split("/", parts: 2) |> hd()
+  def skill_name_from_uri(_), do: nil
 
   defp mime_type(path) do
     case Path.extname(path) do

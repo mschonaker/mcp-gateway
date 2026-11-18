@@ -10,6 +10,8 @@ defmodule McpGateway.Router do
   @supported_versions [@modern_version | @legacy_versions]
   @cache %{"ttlMs" => 0, "cacheScope" => "private"}
   @server_info %{"name" => "mcp-gateway", "version" => "0.2.0"}
+  @local_tools_policy "local:tools"
+  @skills_policy "local:skills"
 
   plug Plug.Logger
   plug :fetch_query_params
@@ -139,8 +141,16 @@ defmodule McpGateway.Router do
       case Store.get_upstream(name) do
         %{oauth: oauth} = up when is_map(oauth) ->
           state = random_token()
-          Store.put_upstream_oauth_state(state, %{upstream: name, inserted_at: System.system_time(:second)})
-          redirect(conn, upstream_authorize_url(up, state))
+          verifier = pkce_verifier()
+          challenge = :crypto.hash(:sha256, verifier) |> Base.url_encode64(padding: false)
+
+          Store.put_upstream_oauth_state(state, %{
+            upstream: name,
+            verifier: verifier,
+            inserted_at: System.system_time(:second)
+          })
+
+          redirect(conn, upstream_authorize_url(up, state, challenge))
         _ ->
           html(conn, 400, error_page("Upstream '#{name}' has no OAuth configuration. Configure auth_url, token_url, client_id, client_secret, redirect_uri/scope via upstream settings."))
       end
@@ -158,7 +168,7 @@ defmodule McpGateway.Router do
         case Store.get_upstream(name) do
           nil -> html(conn, 404, error_page("Unknown upstream."))
           up ->
-            case exchange_upstream_code(up, code) do
+            case exchange_upstream_code(up, code, saved.verifier) do
               {:ok, token_resp} ->
                 auth = %{type: "oauth", access_token: token_resp["access_token"], refresh_token: token_resp["refresh_token"], token_type: token_resp["token_type"]}
                 up = Map.put(up, :auth, auth) |> Map.put(:status, "oauth connected")
@@ -178,15 +188,19 @@ defmodule McpGateway.Router do
       case Store.get_upstream(name) do
         nil -> html(conn, 404, error_page("Unknown upstream."))
         up ->
+          previous = up[:oauth] || %{}
+          secret = param(conn, "oauth_client_secret")
+
           oauth = %{
             auth_url: param(conn, "oauth_auth_url"),
             token_url: param(conn, "oauth_token_url"),
             client_id: param(conn, "oauth_client_id"),
-            client_secret: param(conn, "oauth_client_secret"),
+            client_secret: if(secret in [nil, ""], do: previous[:client_secret], else: secret),
             scope: param(conn, "oauth_scope") || ""
           }
-          up = Map.put(up, :oauth, oauth) |> Map.put(:auth, %{type: "oauth_pending"})
-          Store.put_upstream(name, up)
+
+          auth = if up[:auth][:type] == "oauth", do: up.auth, else: %{type: "oauth_pending"}
+          Store.put_upstream(name, up |> Map.put(:oauth, oauth) |> Map.put(:auth, auth))
           redirect(conn, "/")
       end
     end)
@@ -243,7 +257,7 @@ defmodule McpGateway.Router do
       "ping" -> ok(id, %{})
       "tools/list" -> ok(id, cached(%{"tools" => all_mcp_tools()}))
       "tools/call" -> call_mcp_tool(id, params, user)
-      "skills/list" -> ok(id, %{"skills" => Local.list_skills()})
+      "skills/list" -> ok(id, %{"skills" => visible_skills()})
       "skills/get" -> mcp_skill_get(id, params)
       "resources/list" -> ok(id, cached(%{"resources" => skill_resources()}))
       "resources/read" -> mcp_resource_read(id, params)
@@ -257,23 +271,25 @@ defmodule McpGateway.Router do
     cond do
       Local.local_tool?(name) ->
         {:ok, tool} = Local.denamespace_tool(name)
-        case Local.call_tool(tool, args, %{email: user.email, subject: user[:subject], mcp_authenticated: true}) do
-          {:ok, result} -> ok(id, result)
+        ctx = %{email: user.email, subject: user[:subject], mcp_authenticated: true}
+
+        with true <- Store.allowed?(@local_tools_policy, tool),
+             {:ok, result} <- Local.call_tool(tool, args, ctx) do
+          ok(id, result)
+        else
+          false -> ok(id, tool_error("blocked by policy: #{name}"))
           {:error, msg} -> ok(id, tool_error(msg))
         end
 
       true ->
         case String.split(name, "__", parts: 2) do
           [upstream, tool] ->
-            if Store.get_upstream(upstream) == nil do
-              err(id, -32602, "No MCP server named '#{upstream}'")
-            else
-              if Store.allowed?(upstream, tool) do
-                call_remote_tool(id, upstream, tool, args)
-              else
-                ok(id, tool_error("blocked by policy: #{name}"))
-              end
+            cond do
+              Store.get_upstream(upstream) == nil -> err(id, -32602, "No MCP server named '#{upstream}'")
+              !Store.allowed?(upstream, tool) -> ok(id, tool_error("blocked by policy: #{name}"))
+              true -> call_remote_tool(id, upstream, tool, args)
             end
+
           _ ->
             err(id, -32602, "Tool name must be '<server>__<tool>'")
         end
@@ -293,17 +309,23 @@ defmodule McpGateway.Router do
   end
 
   defp mcp_skill_get(id, %{"uri" => uri}) do
-    case Local.get_skill(uri) do
-      {:ok, skill} -> ok(id, %{"skill" => skill})
-      {:error, _} -> err(id, -32602, "Unknown skill URI: #{uri}")
+    with true <- skill_allowed?(uri),
+         {:ok, skill} <- Local.get_skill(uri) do
+      ok(id, %{"skill" => skill})
+    else
+      false -> err(id, -32602, "blocked by policy: #{uri}")
+      _ -> err(id, -32602, "Unknown skill URI: #{uri}")
     end
   end
   defp mcp_skill_get(id, _), do: err(id, -32602, "skills/get requires a 'uri' parameter")
 
   defp mcp_resource_read(id, %{"uri" => uri}) do
-    case Local.read_resource(uri) do
-      {:ok, contents} -> ok(id, cached(%{"contents" => contents}))
-      {:error, _} -> err(id, -32602, "Unknown resource URI: #{uri}")
+    with true <- skill_allowed?(uri),
+         {:ok, contents} <- Local.read_resource(uri) do
+      ok(id, cached(%{"contents" => contents}))
+    else
+      false -> err(id, -32602, "blocked by policy: #{uri}")
+      _ -> err(id, -32602, "Unknown resource URI: #{uri}")
     end
   end
   defp mcp_resource_read(id, _), do: err(id, -32602, "resources/read requires a 'uri' parameter")
@@ -320,16 +342,25 @@ defmodule McpGateway.Router do
 
   defp capabilities do
     base = %{"tools" => %{"listChanged" => false}}
-    if Local.list_skills() == [], do: base, else: Map.merge(base, %{"resources" => %{}, "extensions" => %{"io.modelcontextprotocol/skills" => %{}}})
+    if visible_skills() == [], do: base, else: Map.merge(base, %{"resources" => %{}, "extensions" => %{"io.modelcontextprotocol/skills" => %{}}})
   end
 
   defp skill_resources do
-    Local.list_skills()
+    visible_skills()
     |> Enum.flat_map(fn skill ->
       Enum.map(skill["resources"] || [], fn file ->
         %{"uri" => file["uri"], "name" => file["name"] || file["uri"], "description" => "file of skill #{get_in(skill, ["frontmatter", "name"]) }"}
       end)
     end)
+  end
+
+  defp visible_skills, do: Local.list_skills() |> Enum.filter(fn s -> skill_allowed?(s["uri"]) end)
+
+  defp skill_allowed?(uri) do
+    case Local.skill_name_from_uri(uri) do
+      nil -> false
+      name -> Store.allowed?(@skills_policy, name)
+    end
   end
 
   defp negotiated_version(params) do
@@ -382,16 +413,38 @@ defmodule McpGateway.Router do
     end
   end
 
-  defp upstream_authorize_url(up, state) do
+  defp upstream_authorize_url(up, state, challenge) do
     o = up.oauth
-    q = URI.encode_query(%{response_type: "code", client_id: o.client_id, redirect_uri: Config.base_url() <> "/auth/upstream/callback", scope: o.scope || "", state: state})
+
+    q =
+      URI.encode_query(%{
+        response_type: "code",
+        client_id: o.client_id,
+        redirect_uri: Config.base_url() <> "/auth/upstream/callback",
+        scope: Map.get(o, :scope) || "",
+        state: state,
+        code_challenge: challenge,
+        code_challenge_method: "S256"
+      })
+
     o.auth_url <> "?" <> q
   end
 
-  defp exchange_upstream_code(up, code) do
+  defp pkce_verifier, do: :crypto.strong_rand_bytes(32) |> Base.url_encode64(padding: false)
+
+  defp exchange_upstream_code(up, code, verifier) do
     o = up.oauth
-    body = %{grant_type: "authorization_code", code: code, redirect_uri: Config.base_url() <> "/auth/upstream/callback", client_id: o.client_id, client_secret: o.client_secret}
-    case Req.post(o.token_url, form: body, finch: McpGateway.Finch) do
+
+    body = %{
+      grant_type: "authorization_code",
+      code: code,
+      redirect_uri: Config.base_url() <> "/auth/upstream/callback",
+      client_id: o.client_id,
+      client_secret: o.client_secret,
+      code_verifier: verifier
+    }
+
+    case Req.post(o.token_url, form: body, headers: [{"accept", "application/json"}], finch: McpGateway.Finch) do
       {:ok, %{status: 200, body: resp}} when is_map(resp) -> {:ok, resp}
       {:ok, %{status: s, body: b}} -> {:error, {s, b}}
       {:error, r} -> {:error, r}
@@ -478,13 +531,8 @@ defmodule McpGateway.Router do
       #{harness_setup_html(Config.base_url() <> "/mcp", user.mcp_token || "")}</div>
 
     <div class="card"><h2>Local MCP Tools</h2>
-      <ul><li><code>local__whoami</code> - diagnostic identity (MCP tool)</li><li><code>local__datetime</code> - current date/time (MCP tool)</li></ul></div>
-
-    <div class="card"><h2>Filesystem Skills (SEP-2640)</h2>
-      #{if skills == [], do: "<p class='muted'>No skills found in <code>#{esc(Config.skills_dir())}</code>.</p>", else: "<ul>" <> Enum.map_join(skills, "", fn s -> "<li><code>#{esc(s["uri"])}</code> - #{esc(get_in(s, ["frontmatter", "description"]) || "")}</li>" end) <> "</ul>"}
-      <p class="muted">Skills are loaded from files on disk. Copy skill folders/files into the skills directory.</p></div>
-
-    <div class="card"><h2>Add / Update Upstream MCP (HTTP)</h2>
+      #{local_tools_table()}
+      <h2>Add / Update Upstream MCP (HTTP)</h2>
       <form method="post" action="/ui/upstreams" class="row">
         <input name="name" placeholder="name (e.g. remote1)" required>
         <input name="url" placeholder="https://host/mcp" style="width:320px" required>
@@ -492,10 +540,53 @@ defmodule McpGateway.Router do
         <input name="bearer_token" placeholder="bearer token (if used)" style="width:220px">
         <button type="submit">Save & Connect</button>
       </form>
-      <p class="muted">For upstreams that need OAuth, save the upstream first, then configure OAuth and click Connect OAuth (flows run from this web UI only).</p></div>
+      <p class="muted">For upstreams that need OAuth, save the upstream first, then configure OAuth and click Connect OAuth (flows run from this web UI only).</p>
+      #{Enum.map_join(upstreams, "", &upstream_section/1)}</div>
 
-    #{Enum.map_join(upstreams, "", &upstream_card/1)}
+    <div class="card"><h2>Filesystem Skills (SEP-2640)</h2>
+      #{skills_table(skills)}
+      <p class="muted">Skills are loaded from files on disk. Copy skill folders/files into the skills directory.</p></div>
     """)
+  end
+
+  defp local_tools_table do
+    policy = Store.policy_for(@local_tools_policy)
+
+    rows =
+      Enum.map_join(Local.tools(), "", fn tool ->
+        {:ok, name} = Local.denamespace_tool(tool["name"])
+        policy_row(tool["name"], tool["description"], @local_tools_policy, name, Map.get(policy, name, true))
+      end)
+
+    policy_table("Tool", rows)
+  end
+
+  defp skills_table(skills) do
+    if skills == [] do
+      "<p class='muted'>No skills found in <code>#{esc(Config.skills_dir())}</code>.</p>"
+    else
+      policy = Store.policy_for(@skills_policy)
+
+      rows =
+        Enum.map_join(skills, "", fn skill ->
+          uri = skill["uri"]
+          name = Local.skill_name_from_uri(uri)
+          description = get_in(skill, ["frontmatter", "description"]) || ""
+          policy_row(uri, description, @skills_policy, name, Map.get(policy, name, true))
+        end)
+
+      policy_table("Skill", rows)
+    end
+  end
+
+  defp policy_table(label, rows), do: "<table><tr><th>#{label}</th><th>Description</th><th>Policy</th></tr>#{rows}</table>"
+
+  defp policy_row(display, description, scope, tool, allowed) do
+    value = if allowed, do: "false", else: "true"
+    label = if allowed, do: "Block", else: "Allow"
+    state = if allowed, do: "<span class='ok'>allowed</span>", else: "<span class='err'>blocked</span>"
+    toggle = ~s(<form method="post" action="/ui/toggle" style="display:inline"><input type="hidden" name="upstream" value="#{esc(scope)}"><input type="hidden" name="tool" value="#{esc(tool)}"><input type="hidden" name="value" value="#{value}"><button type="submit">#{label}</button></form>)
+    "<tr><td><code>#{esc(display)}</code></td><td>#{esc(description)}</td><td>#{state} #{toggle}</td></tr>"
   end
 
   defp harness_setup_html(endpoint, token) do
@@ -503,7 +594,7 @@ defmodule McpGateway.Router do
     auth = shell_quote("Authorization: Bearer #{token}")
 
     commands = [
-      {"opencode", "OpenCode", "opencode mcp add gateway --url #{url} --header #{shell_quote("Authorization=Bearer #{token}")}"},
+      {"opencode", "OpenCode", "opencode mcp add gateway --global --url #{url} --header #{shell_quote("Authorization=Bearer #{token}")}"},
       {"codex", "Codex", "export MCP_GATEWAY_TOKEN=#{shell_quote(token)}\ncodex mcp add gateway --url #{url} --bearer-token-env-var MCP_GATEWAY_TOKEN"},
       {"claude", "Claude Code", "claude mcp add --transport http gateway #{url} --header #{auth}"},
       {"copilot", "GitHub Copilot", "copilot mcp add --transport http --header #{auth} gateway #{url}"},
@@ -530,7 +621,7 @@ defmodule McpGateway.Router do
 
   defp shell_quote(value), do: "'" <> String.replace(to_string(value), "'", "'\\''") <> "'"
 
-  defp upstream_card(up) do
+  defp upstream_section(up) do
     tools = Store.get_tools(up.name)
     policy = Store.policy_for(up.name)
     status_class = if up.status == "connected" or up.status == "oauth connected", do: "ok", else: "err"
@@ -539,21 +630,13 @@ defmodule McpGateway.Router do
     else
       Enum.map_join(tools, "", fn t ->
         tname = t["name"] || ""
-        full = up.name <> "__" <> tname
-        allowed = Map.get(policy, tname, true)
-        btn = if allowed do
-          ~s(<form method="post" action="/ui/toggle" style="display:inline"><input type="hidden" name="upstream" value="#{esc(up.name)}"><input type="hidden" name="tool" value="#{esc(tname)}"><input type="hidden" name="value" value="false"><button type="submit">Block</button></form>)
-        else
-          ~s(<form method="post" action="/ui/toggle" style="display:inline"><input type="hidden" name="upstream" value="#{esc(up.name)}"><input type="hidden" name="tool" value="#{esc(tname)}"><input type="hidden" name="value" value="true"><button type="submit">Allow</button></form>)
-        end
-        state = if allowed, do: "<span class='ok'>allowed</span>", else: "<span class='err'>blocked</span>"
-        "<tr><td><code>#{esc(full)}</code></td><td>#{esc(t["description"] || "")}</td><td>#{state} #{btn}</td></tr>"
+        policy_row(up.name <> "__" <> tname, t["description"] || "", up.name, tname, Map.get(policy, tname, true))
       end)
     end
 
     oauth = up[:oauth] || %{}
     """
-    <div class="card"><h2>Upstream: #{esc(up.name)}</h2>
+    <h2>Upstream: #{esc(up.name)}</h2>
       <p>URL: <code>#{esc(up.url)}</code> | Status: <span class="#{status_class}">#{esc(to_string(up.status))}</span></p>
       #{if up[:error], do: "<p class='err'>#{esc(to_string(up.error))}</p>", else: ""}
       <div class="row">
@@ -565,7 +648,7 @@ defmodule McpGateway.Router do
           <div class="row"><input name="oauth_auth_url" placeholder="auth URL" value="#{esc(oauth[:auth_url] || "")}" style="width:320px">
           <input name="oauth_token_url" placeholder="token URL" value="#{esc(oauth[:token_url] || "")}" style="width:320px"></div>
           <div class="row"><input name="oauth_client_id" placeholder="client id" value="#{esc(oauth[:client_id] || "")}">
-          <input name="oauth_client_secret" placeholder="client secret" value="#{esc(oauth[:client_secret] || "")}">
+          <input name="oauth_client_secret" type="password" placeholder="client secret (leave blank to keep)">
           <input name="oauth_scope" placeholder="scope" value="#{esc(oauth[:scope] || "")}"></div>
           <button type="submit">Save OAuth Config</button>
         </form>
@@ -573,8 +656,7 @@ defmodule McpGateway.Router do
         <p class="muted">Callback: <code>#{esc(Config.base_url())}/auth/upstream/callback</code></p>
       </details>
       <h3>Functions / Toggles (default: allowed)</h3>
-      <table><tr><th>Tool</th><th>Description</th><th>Policy</th></tr>#{tool_rows}</table>
-    </div>
+      #{policy_table("Tool", tool_rows)}
     """
   end
 

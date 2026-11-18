@@ -8,10 +8,15 @@ An enterprise-oriented local MCP gateway that exposes **MCP over Streamable HTTP
 - **Output (gateway → upstream MCPs):** remote MCP servers over **Streamable HTTP only** (no stdio). Upstream auth modes: `none`, static `bearer`, or `oauth` tokens obtained from the web UI.
 - **Identity:** Google OIDC login for the web UI. Access is restricted by an allowlist file (default: `config/allowlist.txt`, currently `mschonaker@gmail.com`).
 - **No database:** sessions, MCP bearer tokens, upstream configs/tokens, and policy toggles live in memory and are lost on restart.
-- **Policy:** per-upstream, per-function allow/block toggles in the web UI. Default: **allowed (on)**.
+- **Policy:** allow/block toggles in the web UI for upstream tools, local tools, and filesystem skills. Default: **allowed (on)**.
 - **Local MCP tools:** `local__whoami` (diagnostic identity seen by gateway) and `local__datetime` (current UTC time in ISO 8601).
 - **Upstream example tools:** upstreams discovered through the web UI are exposed as `<upstream>__<tool>` (for a configured `geolocation` upstream: `geolocation__lookup_ipv4`, `geolocation__lookup_ipv6`).
 - **Skills:** SEP-2640 skills loaded from the local filesystem (`skills/` by default). Example skills included: `whoami-check` and `datetime-now`.
+
+## Documentation
+
+- [Connect the GitHub MCP upstream with OAuth](docs/github-upstream-oauth.md)
+- [SEP-2640 status](docs/sep-2640-status.md)
 
 ## Requirements
 
@@ -92,8 +97,8 @@ Open the web UI at `http://localhost:4000`, sign in with Google, then:
 - Copy the **MCP bearer token** shown on the dashboard and configure your MCP client with:
   - URL: `http://localhost:4000/mcp`
   - Header: `Authorization: Bearer <token>`
-- Add upstream MCP servers (Streamable HTTP URLs), choose auth mode (none/bearer), refresh tools, and use toggles to allow/block functions.
-- For upstream OAuth: save OAuth config in the upstream card and click **Connect OAuth** (flow runs in the browser; tokens stored in memory only). Callback: `BASE_URL/auth/upstream/callback`.
+- Add upstream MCP servers (Streamable HTTP URLs), choose auth mode (none/bearer), refresh tools, and use toggles to allow/block upstream tools, local tools, and skills.
+- For upstream OAuth: save OAuth config in the upstream card and click **Connect OAuth** (flow runs in the browser; tokens stored in memory only). Callback: `BASE_URL/auth/upstream/callback`. For GitHub, follow [docs/github-upstream-oauth.md](docs/github-upstream-oauth.md).
 - Add skills by copying skill folders (with `SKILL.md`) into `SKILLS_DIR`.
 
 ## MCP surface
@@ -101,10 +106,10 @@ Open the web UI at `http://localhost:4000`, sign in with Google, then:
 - `server/discover` (revision `2026-07-28`)
 - `initialize`, `ping` (revisions `2024-11-05` and `2025-03-26`)
 - `tools/list`, `tools/call`
-  - Local: `local__whoami`, `local__datetime`
+  - Local: `local__whoami`, `local__datetime` (subject to policy toggles)
   - Remote: `<upstream>__<tool>` (subject to policy toggles); for a configured `geolocation` upstream: `geolocation__lookup_ipv4`, `geolocation__lookup_ipv6`
-- `skills/list`, `skills/get` (SEP-2640, filesystem)
-- `resources/list`, `resources/read` (skill files)
+- `skills/list`, `skills/get` (SEP-2640, filesystem; subject to policy toggles)
+- `resources/list`, `resources/read` (skill files; subject to policy toggles)
 
 ## Notes
 
